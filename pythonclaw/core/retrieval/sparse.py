@@ -41,7 +41,9 @@ class BM25Retriever:
     def fit(self, corpus: list[dict]) -> None:
         self._corpus = corpus
         self._tokenized = [_tokenize(c["content"]) for c in corpus]
-        if _HAS_BM25 and corpus:
+        # BM25Okapi divides by average doc length — an all-empty tokenisation
+        # would make that 0 and crash retrieval, so fall back to word-overlap.
+        if _HAS_BM25 and corpus and any(self._tokenized):
             self._bm25 = BM25Okapi(self._tokenized)
 
     def retrieve(self, query: str, top_k: int) -> list[tuple[float, dict]]:

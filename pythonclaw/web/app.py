@@ -768,9 +768,12 @@ async def _api_list_files(request: Request):
 
 # ── Web file sender ───────────────────────────────────────────────────────────
 
-def _register_web_file_sender(loop: asyncio.AbstractEventLoop, ws: WebSocket) -> None:
-    """Register a sync callback so the Agent can push file-download links to the web UI."""
-    from ..core.tools import set_file_sender
+def _make_web_file_sender(loop: asyncio.AbstractEventLoop, ws: WebSocket):
+    """Build a sync callback so the Agent can push file downloads to the web UI.
+
+    Assigned to ``agent.file_sender`` per message — a process-wide global
+    would let one client receive files generated for another.
+    """
 
     def _sender(path: str, caption: str = "") -> None:
         import base64 as _b64
@@ -795,7 +798,7 @@ def _register_web_file_sender(loop: asyncio.AbstractEventLoop, ws: WebSocket) ->
         future = asyncio.run_coroutine_threadsafe(_push(), loop)
         future.result(timeout=60)
 
-    set_file_sender(_sender)
+    return _sender
 
 
 # ── WebSocket Chat ────────────────────────────────────────────────────────────
@@ -828,7 +831,12 @@ async def _ws_chat(websocket: WebSocket):
 
             if message.startswith("/compact"):
                 hint = message[len("/compact"):].strip() or None
-                result = agent.compact(instruction=hint)
+                # Blocking LLM call — keep it off the event loop and
+                # serialize against any in-flight chat.
+                async with _get_chat_lock():
+                    result = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: agent.compact(instruction=hint)
+                    )
                 await websocket.send_json({"type": "response", "content": result})
                 continue
 
@@ -853,7 +861,7 @@ async def _ws_chat(websocket: WebSocket):
 
             loop = asyncio.get_event_loop()
 
-            _register_web_file_sender(loop, websocket)
+            agent.file_sender = _make_web_file_sender(loop, websocket)
 
             try:
                 token_queue: asyncio.Queue[str | None] = asyncio.Queue()

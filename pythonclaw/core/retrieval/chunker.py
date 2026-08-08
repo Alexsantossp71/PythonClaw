@@ -51,7 +51,7 @@ def chunk_text(
                     idx += 1
                 if end == len(para):
                     break
-                start += chunk_size - overlap
+                start += max(1, chunk_size - overlap)
 
     return chunks
 

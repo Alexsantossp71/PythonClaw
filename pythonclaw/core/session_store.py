@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import re
+import threading
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
@@ -65,6 +66,7 @@ class SessionStore:
         self.base_dir = base_dir or _default_store_dir()
         self.max_messages = max_messages
         os.makedirs(self.base_dir, exist_ok=True)
+        self._io_lock = threading.Lock()
 
     # ── File path ─────────────────────────────────────────────────────────────
 
@@ -75,11 +77,59 @@ class SessionStore:
 
     # ── Serialisation ─────────────────────────────────────────────────────────
 
+    # Lines that would be mistaken for block structure when re-parsing
+    _STRUCTURAL_PREFIXES = ("### ", "<details><summary>Tool Calls", "<!-- msg:")
+    _STRUCTURAL_EXACT = ("---", "</details>")
+
+    @classmethod
+    def _escape_content(cls, content: str) -> str:
+        """Escape content lines that collide with the block format —
+        LLM answers routinely contain '### ' headers and '---' rules,
+        and without escaping they were silently deleted on restore."""
+        out = []
+        for line in content.split("\n"):
+            s = line.strip()
+            if s.startswith(cls._STRUCTURAL_PREFIXES) or s in cls._STRUCTURAL_EXACT:
+                line = "\\" + line
+            out.append(line)
+        return "\n".join(out).replace("<!-- msg:", "<!-- msg\\:")
+
+    @classmethod
+    def _unescape_line(cls, line: str) -> str:
+        if line.startswith("\\"):
+            rest = line[1:]
+            s = rest.strip()
+            if s.startswith(cls._STRUCTURAL_PREFIXES) or s in cls._STRUCTURAL_EXACT:
+                return rest
+        return line
+
+    @staticmethod
+    def _flatten_content(content) -> str:
+        """Reduce multimodal content arrays to persistable text.
+
+        Base64 image payloads are not round-tripped — a placeholder keeps
+        the conversational context without megabytes of dead weight.
+        """
+        if not isinstance(content, list):
+            return content or ""
+        text_parts = [
+            p.get("text", "") for p in content
+            if isinstance(p, dict) and p.get("type") == "text"
+        ]
+        n_images = sum(
+            1 for p in content
+            if isinstance(p, dict) and p.get("type") in ("image_url", "image")
+        )
+        flat = "\n".join(t for t in text_parts if t)
+        if n_images:
+            flat = (flat + f"\n[{n_images} image(s) attached — not persisted]").strip()
+        return flat
+
     @staticmethod
     def _msg_to_markdown(msg: dict) -> str:
         """Convert a single message dict to a Markdown block."""
         role = msg.get("role", "unknown")
-        content = msg.get("content", "") or ""
+        content = SessionStore._flatten_content(msg.get("content", "") or "")
         ts = msg.get("_ts") or datetime.now().isoformat(timespec="seconds")
 
         # Build metadata for round-trip parsing
@@ -102,7 +152,7 @@ class SessionStore:
         lines.append("")
 
         if content:
-            lines.append(content)
+            lines.append(SessionStore._escape_content(content))
             lines.append("")
 
         # Embed tool_calls as JSON
@@ -188,9 +238,9 @@ class SessionStore:
                         continue
                     continue
 
-                content_lines.append(line)
+                content_lines.append(SessionStore._unescape_line(line))
 
-            content = "\n".join(content_lines).strip()
+            content = "\n".join(content_lines).strip().replace("<!-- msg\\:", "<!-- msg:")
             if content:
                 msg["content"] = content
             else:
@@ -222,14 +272,25 @@ class SessionStore:
             to_save = to_save[-self.max_messages:]
 
         path = self._path(session_id)
+        tmp = path + ".tmp"
         try:
             lines = [f"# Session: {session_id}\n\n"]
             for msg in to_save:
                 lines.append(self._msg_to_markdown(msg))
-            with open(path, "w", encoding="utf-8") as f:
-                f.write("\n".join(lines))
-        except OSError as exc:
+            # Atomic replace under a lock — a crash mid-write or two
+            # concurrent writers must never leave a truncated history file.
+            with self._io_lock:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines))
+                os.replace(tmp, path)
+        except Exception as exc:
+            # Persistence failure must never destroy a completed turn.
             logger.error("[SessionStore] Failed to save session '%s': %s", session_id, exc)
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
 
     def load(self, session_id: str) -> list[dict]:
         """

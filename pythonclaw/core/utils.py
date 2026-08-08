@@ -5,6 +5,32 @@ Shared utilities for pythonclaw.
 from __future__ import annotations
 
 
+def split_message(text: str, limit: int = 4096) -> list[str]:
+    """Split text into chunks at natural boundaries (used by all channels).
+
+    Tries paragraph breaks first, then newlines, then word boundaries,
+    and only falls back to a hard character cut as a last resort.
+    """
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    min_break = limit // 3
+    while text:
+        if len(text) <= limit:
+            chunks.append(text)
+            break
+        split_at = text.rfind('\n\n', min_break, limit)
+        if split_at < min_break:
+            split_at = text.rfind('\n', min_break, limit)
+        if split_at < min_break:
+            split_at = text.rfind(' ', min_break, limit)
+        if split_at < min_break:
+            split_at = limit
+        chunks.append(text[:split_at].rstrip())
+        text = text[split_at:].lstrip()
+    return chunks
+
+
 def parse_frontmatter(content: str) -> tuple[dict, str]:
     """
     Parse YAML-style frontmatter delimited by '---' from *content*.

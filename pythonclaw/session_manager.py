@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, AsyncIterator, Callable
 
@@ -73,6 +74,11 @@ class SessionManager:
         self._store = store
         self._sessions: dict[str, "Agent"] = {}
 
+        # Guards _sessions/_locks creation — WhatsApp webhooks arrive on
+        # worker threads while Telegram/Discord run on the event loop, so
+        # a bare check-then-act here could build two Agents for one session.
+        self._registry_guard = threading.Lock()
+
         # Per-session locks prevent interleaving within the same session
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -91,11 +97,18 @@ class SessionManager:
     # ── Core API ─────────────────────────────────────────────────────────────
 
     def get_or_create(self, session_id: str) -> "Agent":
-        """Return the existing Agent for session_id, creating one if needed."""
-        if session_id not in self._sessions:
-            logger.info("[SessionManager] Creating session '%s'", session_id)
-            self._sessions[session_id] = self._factory(session_id)
-        return self._sessions[session_id]
+        """Return the existing Agent for session_id, creating one if needed.
+
+        Thread-safe: may be called from the event loop or worker threads.
+        """
+        agent = self._sessions.get(session_id)
+        if agent is not None:
+            return agent
+        with self._registry_guard:
+            if session_id not in self._sessions:
+                logger.info("[SessionManager] Creating session '%s'", session_id)
+                self._sessions[session_id] = self._factory(session_id)
+            return self._sessions[session_id]
 
     def reset(self, session_id: str) -> "Agent":
         """Discard the current Agent, erase persisted history, and start fresh."""
@@ -123,9 +136,11 @@ class SessionManager:
 
     def get_lock(self, session_id: str) -> asyncio.Lock:
         """Return (creating if necessary) the per-session lock."""
-        if session_id not in self._locks:
-            self._locks[session_id] = asyncio.Lock()
-        return self._locks[session_id]
+        lock = self._locks.get(session_id)
+        if lock is None:
+            with self._registry_guard:
+                lock = self._locks.setdefault(session_id, asyncio.Lock())
+        return lock
 
     @asynccontextmanager
     async def acquire(self, session_id: str) -> AsyncIterator[None]:

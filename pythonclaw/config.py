@@ -17,6 +17,7 @@ Load order (later sources override earlier ones):
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from pathlib import Path
@@ -38,9 +39,12 @@ def home() -> Path:
 def _strip_json5(text: str) -> str:
     """Strip // comments and trailing commas so standard json.loads works.
 
-    Handles // inside quoted strings correctly (they are preserved).
+    String literals are never modified — both // sequences and ",}"/",]"
+    inside quoted values are preserved (the trailing-comma cleanup runs
+    only on the structural text between strings).
     """
-    result: list[str] = []
+    segments: list[tuple[bool, str]] = []  # (is_string_literal, chunk)
+    buf: list[str] = []
     i = 0
     n = len(text)
     while i < n:
@@ -56,18 +60,25 @@ def _strip_json5(text: str) -> str:
                     break
                 else:
                     j += 1
-            result.append(text[i:j])
+            if buf:
+                segments.append((False, "".join(buf)))
+                buf = []
+            segments.append((True, text[i:j]))
             i = j
         elif ch == '/' and i + 1 < n and text[i + 1] == '/':
             # Line comment — skip until end of line
             while i < n and text[i] != '\n':
                 i += 1
         else:
-            result.append(ch)
+            buf.append(ch)
             i += 1
-    text = "".join(result)
-    text = _TRAILING_COMMA_RE.sub(r"\1", text)
-    return text
+    if buf:
+        segments.append((False, "".join(buf)))
+
+    return "".join(
+        chunk if is_string else _TRAILING_COMMA_RE.sub(r"\1", chunk)
+        for is_string, chunk in segments
+    )
 
 
 def _find_config_file() -> Path | None:
@@ -139,9 +150,18 @@ def get(*keys: str, env: str | None = None, default: Any = None) -> Any:
 
 
 def get_int(*keys: str, env: str | None = None, default: int = 0) -> int:
-    """Get an integer config value."""
+    """Get an integer config value; malformed values fall back to *default*."""
     val = get(*keys, env=env, default=default)
-    return int(val) if val is not None else default
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        logging.getLogger(__name__).warning(
+            "Config value %s=%r is not an integer — using default %r",
+            ".".join(keys), val, default,
+        )
+        return default
 
 
 def get_str(*keys: str, env: str | None = None, default: str = "") -> str:
@@ -167,9 +187,21 @@ def get_list(*keys: str, env: str | None = None, default: list | None = None) ->
 
 
 def get_int_list(*keys: str, env: str | None = None) -> list[int]:
-    """Get a list of integers.  Env var is parsed as comma-separated ints."""
+    """Get a list of integers.  Env var is parsed as comma-separated ints.
+
+    Non-numeric entries are skipped with a warning instead of crashing
+    channel startup (e.g. a username typed where a numeric ID belongs).
+    """
     raw = get_list(*keys, env=env)
-    return [int(v) for v in raw] if raw else []
+    out: list[int] = []
+    for v in raw or []:
+        try:
+            out.append(int(v))
+        except (TypeError, ValueError):
+            logging.getLogger(__name__).warning(
+                "Ignoring non-integer entry %r in config list %s", v, ".".join(keys),
+            )
+    return out
 
 
 def config_path() -> Path | None:

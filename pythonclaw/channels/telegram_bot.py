@@ -89,7 +89,8 @@ class TelegramBot:
         if self._app is None:
             logger.warning("[Telegram] send_message called before bot is running")
             return
-        await self._app.bot.send_message(chat_id=chat_id, text=text)
+        for chunk in _split_message(text):
+            await self._app.bot.send_message(chat_id=chat_id, text=chunk)
 
     # ── Access control ────────────────────────────────────────────────────────
 
@@ -99,6 +100,10 @@ class TelegramBot:
         return user_id in self._allowed_users
 
     async def _check_access(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        # Edited messages / channel posts have update.message == None —
+        # never crash on them, and only serve fresh direct messages.
+        if update.message is None:
+            return False
         user = update.effective_user
         if user is None or not self._is_allowed(user.id):
             logger.warning("[Telegram] Rejected user_id=%s", user.id if user else "unknown")
@@ -113,20 +118,28 @@ class TelegramBot:
     def _is_mentioned(self, update: Update) -> bool:
         """Check if the bot is @mentioned in the message text."""
         text = update.message.text or update.message.caption or ""
-        if self._bot_username and f"@{self._bot_username}" in text:
+        if self._bot_username and f"@{self._bot_username.lower()}" in text.lower():
             return True
         entities = update.message.entities or update.message.caption_entities or []
-        for ent in entities:
-            if ent.type == "mention" and self._bot_username:
-                mention = text[ent.offset:ent.offset + ent.length]
-                if mention.lower() == f"@{self._bot_username.lower()}":
-                    return True
+        if entities and self._bot_username:
+            # Telegram entity offsets are UTF-16 code units, not str indices —
+            # an emoji before the mention shifts a naive slice.
+            u16 = text.encode("utf-16-le")
+            for ent in entities:
+                if ent.type == "mention":
+                    mention = u16[ent.offset * 2:(ent.offset + ent.length) * 2].decode(
+                        "utf-16-le", errors="ignore"
+                    )
+                    if mention.lower() == f"@{self._bot_username.lower()}":
+                        return True
         return False
 
     def _strip_mention(self, text: str) -> str:
-        """Remove the @bot mention from message text."""
+        """Remove the @bot mention from message text (case-insensitive)."""
         if self._bot_username:
-            text = text.replace(f"@{self._bot_username}", "").strip()
+            text = re.sub(
+                rf"@{re.escape(self._bot_username)}", "", text, flags=re.IGNORECASE
+            ).strip()
         return text
 
     # ── Command handlers ──────────────────────────────────────────────────────
@@ -181,7 +194,13 @@ class TelegramBot:
         hint: str | None = " ".join(context.args).strip() or None if context.args else None
         await update.message.reply_text("\u23f3 Compacting conversation history...")
         try:
-            result = agent.compact(instruction=hint)
+            # compact() makes a blocking LLM call and mutates history \u2014
+            # run off-loop and under the session lock.
+            async with self._sm.acquire(sid):
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(
+                    None, lambda: agent.compact(instruction=hint)
+                )
         except Exception as exc:
             result = f"Compaction failed: {exc}"
         for chunk in _split_message(result):
@@ -245,7 +264,10 @@ class TelegramBot:
             async with self._sm.acquire(sid):
                 loop = asyncio.get_event_loop()
                 chat_id = update.effective_chat.id
-                self._register_file_sender(loop, chat_id)
+                # Per-agent sender (not a process-wide global): concurrent
+                # sessions on other channels must never receive this
+                # session's files.
+                agent.file_sender = self._make_file_sender(loop, chat_id)
                 future = loop.run_in_executor(
                     None, agent.chat_stream, chat_input, token_queue.put,
                 )
@@ -282,17 +304,28 @@ class TelegramBot:
         live_msg = None
         live_text = ""
         sent_any = False
+        notified_slow = False
         THROTTLE = 2.0
         last_edit = time.monotonic()
         start_time = time.monotonic()
         _MARKER = re.compile(r'`\[calling:\s*([^\]]+)\]`')
 
         while not future.done():
-            if (time.monotonic() - start_time) > self._AGENT_TIMEOUT:
+            if not notified_slow and (time.monotonic() - start_time) > self._AGENT_TIMEOUT:
+                # Do NOT break out: the executor thread is still mutating the
+                # agent's history, and returning here would release the session
+                # lock while it runs — a second message would then interleave
+                # and corrupt the conversation. Notify the user and keep waiting.
                 logger.warning(
-                    "[Telegram] Agent timeout after %ds", self._AGENT_TIMEOUT,
+                    "[Telegram] Agent still running after %ds", self._AGENT_TIMEOUT,
                 )
-                break
+                notified_slow = True
+                try:
+                    await update.message.reply_text(
+                        "⏳ Still working on this — it's taking longer than usual…"
+                    )
+                except Exception:
+                    pass
 
             drained = False
             while True:
@@ -339,7 +372,7 @@ class TelegramBot:
             await asyncio.sleep(0.4)
 
         # ── Final drain ───────────────────────────────────────────────
-        response = future.result() if future.done() else "(timed out)"
+        response = future.result() if future.done() else "(no response)"
         while True:
             try:
                 buf.append(token_queue.get_nowait())
@@ -349,47 +382,72 @@ class TelegramBot:
         raw = _MARKER.sub("", "".join(buf))
         remaining = _clean_response(raw.strip())
         if remaining and remaining != live_text:
-            try:
-                if live_msg and len(remaining) <= 4096:
-                    await live_msg.edit_text(remaining)
-                elif live_msg:
-                    await live_msg.edit_text(remaining[:4096])
-                    for chunk in _split_message(remaining[4096:]):
-                        await update.message.reply_text(chunk)
-                else:
-                    for chunk in _split_message(remaining):
-                        await update.message.reply_text(chunk)
-                sent_any = True
-            except Exception:
-                pass
+            # Deliver piece by piece — one flood-limited edit must not
+            # silently swallow the rest of a long answer.
+            head, rest = remaining[:4096], remaining[4096:]
+            if live_msg is not None:
+                try:
+                    await live_msg.edit_text(head)
+                    sent_any = True
+                except Exception as exc:
+                    if "not modified" in str(exc).lower():
+                        sent_any = True
+                    else:
+                        # Live edit failed — fall back to sending head as a new message
+                        sent_any = await self._send_chunks(update, head) or sent_any
+            else:
+                sent_any = await self._send_chunks(update, head) or sent_any
+            if rest:
+                sent_any = await self._send_chunks(update, rest) or sent_any
 
         if not sent_any:
             text = _clean_response(response or "(no response)")
-            for chunk in _split_message(text):
-                await update.message.reply_text(chunk)
+            await self._send_chunks(update, text or "(no response)")
 
-    def _register_file_sender(self, loop: asyncio.AbstractEventLoop, chat_id: int) -> None:
-        """Register a sync callback so the Agent can send files via Telegram."""
-        from ..core.tools import set_file_sender
+    async def _send_chunks(self, update: Update, text: str) -> bool:
+        """Send *text* as one or more messages, honouring Telegram flood control.
 
+        Returns True if at least one chunk was delivered.
+        """
+        from telegram.error import RetryAfter
+
+        delivered = False
+        for chunk in _split_message(text):
+            if not chunk.strip():
+                continue
+            for attempt in range(3):
+                try:
+                    await update.message.reply_text(chunk)
+                    delivered = True
+                    break
+                except RetryAfter as exc:
+                    await asyncio.sleep(float(getattr(exc, "retry_after", 3)) + 0.5)
+                except Exception:
+                    logger.warning("[Telegram] chunk delivery failed", exc_info=True)
+                    break
+        return delivered
+
+    def _make_file_sender(self, loop: asyncio.AbstractEventLoop, chat_id: int):
+        """Build a sync callback so the Agent can send files via Telegram.
+
+        Assigned to ``agent.file_sender`` per message (never a process-wide
+        global) so concurrent sessions can't deliver files to the wrong chat.
+        """
         bot_app = self._app
 
         def _sender(path: str, caption: str = "") -> None:
             async def _do_send():
-                try:
-                    with open(path, "rb") as f:
-                        await bot_app.bot.send_document(
-                            chat_id=chat_id,
-                            document=f,
-                            caption=caption[:1024] if caption else None,
-                        )
-                except Exception as exc:
-                    logger.warning("[Telegram] send_file failed: %s", exc)
+                with open(path, "rb") as f:
+                    await bot_app.bot.send_document(
+                        chat_id=chat_id,
+                        document=f,
+                        caption=caption[:1024] if caption else None,
+                    )
 
             future = asyncio.run_coroutine_threadsafe(_do_send(), loop)
             future.result(timeout=60)
 
-        set_file_sender(_sender)
+        return _sender
 
     async def _build_image_input(self, update: Update, caption: str) -> list:
         """Download photo and build a multimodal content array."""
@@ -417,8 +475,14 @@ class TelegramBot:
         from ..core.stt import no_key_message, transcribe_bytes_async
 
         voice = update.message.voice or update.message.audio
-        tg_file = await voice.get_file()
-        audio_bytes = bytes(await tg_file.download_as_bytearray())
+        try:
+            tg_file = await voice.get_file()
+            audio_bytes = bytes(await tg_file.download_as_bytearray())
+        except Exception as exc:
+            # Bot API rejects files > 20 MB with "File is too big"
+            logger.warning("[Telegram] voice download failed: %s", exc)
+            await update.message.reply_text(f"Could not download the audio: {exc}")
+            return None
         mime = voice.mime_type or "audio/ogg"
 
         try:
@@ -469,7 +533,8 @@ class TelegramBot:
         app.add_handler(CommandHandler("clear_files", self._cmd_clear_files))
         app.add_handler(MessageHandler(
             (filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO)
-            & ~filters.COMMAND,
+            & ~filters.COMMAND
+            & filters.UpdateType.MESSAGE,  # exclude edited messages / channel posts
             self._handle_message,
         ))
         self._app = app

@@ -323,11 +323,18 @@ class SkillRegistry:
         return []
 
     def get_resource_path(self, skill_name: str, resource: str) -> str | None:
-        """Return the absolute path to a resource file inside a skill folder."""
+        """Return the absolute path to a resource file inside a skill folder.
+
+        The resource must resolve inside the skill directory — hub-authored
+        skills are untrusted, so ``../`` or absolute resource names are rejected.
+        """
         for meta in self.discover():
             if meta.name != skill_name:
                 continue
-            full = os.path.join(meta.path, resource)
+            root = os.path.realpath(meta.path)
+            full = os.path.realpath(os.path.join(root, resource))
+            if not full.startswith(root + os.sep):
+                return None
             if os.path.isfile(full):
                 return full
             return None

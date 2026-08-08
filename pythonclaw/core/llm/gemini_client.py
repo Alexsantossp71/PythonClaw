@@ -10,7 +10,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 import google.generativeai as genai
-from google.generativeai.types import content_types
+from google.generativeai import protos
 
 from .base import LLMProvider
 from .response import MockChoice, MockFunction, MockMessage, MockResponse, MockToolCall
@@ -24,12 +24,21 @@ class GeminiProvider(LLMProvider):
         self.model = genai.GenerativeModel(model_name)
 
     def _convert_tool_calls_to_parts(self, tool_calls_data: list) -> list:
+        # FunctionCall/FunctionResponse live in google.generativeai.protos and
+        # must be wrapped in a Part — the old content_types.* symbols never
+        # existed, so every multi-turn tool conversation crashed on replay.
         parts = []
         for tc in tool_calls_data:
             func = tc["function"] if isinstance(tc, dict) else tc.function
             name = func["name"] if isinstance(func, dict) else func.name
-            args = json.loads(func["arguments"] if isinstance(func, dict) else func.arguments)
-            parts.append(content_types.FunctionCall(name=name, args=args))
+            raw_args = func["arguments"] if isinstance(func, dict) else func.arguments
+            try:
+                args = json.loads(raw_args) if raw_args else {}
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+            parts.append(
+                protos.Part(function_call=protos.FunctionCall(name=name, args=args))
+            )
         return parts
 
     def chat(
@@ -37,6 +46,7 @@ class GeminiProvider(LLMProvider):
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Any = "auto",
+        **kwargs: Any,
     ) -> Any:
         gemini_history: list[dict] = []
         system_instruction: str | None = None
@@ -66,7 +76,8 @@ class GeminiProvider(LLMProvider):
                     parts.append(content)
                 if msg.get("tool_calls"):
                     parts.extend(self._convert_tool_calls_to_parts(msg["tool_calls"]))
-                gemini_history.append({"role": "model", "parts": parts})
+                if parts:  # Gemini rejects empty-part contents
+                    gemini_history.append({"role": "model", "parts": parts})
 
             elif role == "tool":
                 func_name = self._find_tool_name(messages, msg["tool_call_id"])
@@ -74,10 +85,21 @@ class GeminiProvider(LLMProvider):
                     resp_dict = json.loads(msg["content"])
                 except (json.JSONDecodeError, TypeError):
                     resp_dict = {"result": msg["content"]}
-                gemini_history.append({
-                    "role": "user",
-                    "parts": [content_types.FunctionResponse(name=func_name, response=resp_dict)],
-                })
+                if not isinstance(resp_dict, dict):
+                    resp_dict = {"result": resp_dict}
+                part = protos.Part(
+                    function_response=protos.FunctionResponse(
+                        name=func_name, response=resp_dict,
+                    )
+                )
+                # Parallel tool results must share ONE user turn — Gemini
+                # enforces strict user/model alternation.
+                if gemini_history and gemini_history[-1].get("_tool_batch"):
+                    gemini_history[-1]["parts"].append(part)
+                else:
+                    gemini_history.append(
+                        {"role": "user", "parts": [part], "_tool_batch": True}
+                    )
 
         # Convert tool schemas
         gemini_tools = None
@@ -92,6 +114,10 @@ class GeminiProvider(LLMProvider):
             ]
             if declarations:
                 gemini_tools = [declarations]
+
+        # Drop the internal batching marker before handing to the SDK
+        for entry in gemini_history:
+            entry.pop("_tool_batch", None)
 
         # Inject system instruction into the first user message
         if gemini_history and gemini_history[0]["role"] == "model":

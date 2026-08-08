@@ -101,6 +101,9 @@ class MemoryStorage:
                     if line.startswith("> Updated:") or line.strip() == "":
                         continue
                     past_header = True
+                # Unescape structural markers that _save_memory_md escaped
+                if line.startswith("\\## ") or line.startswith("\\> Updated:"):
+                    line = line[1:]
                 content_lines.append(line)
 
             entries[key] = {
@@ -110,8 +113,22 @@ class MemoryStorage:
 
         return entries
 
+    @staticmethod
+    def _escape_value(value: str) -> str:
+        """Escape lines that would be mistaken for entry structure on re-parse.
+
+        Without this, a value containing an ``## heading`` line splits into a
+        phantom key on the next load and the original value is lost.
+        """
+        out = []
+        for line in value.split("\n"):
+            if line.startswith("## ") or line.startswith("> Updated:"):
+                line = "\\" + line
+            out.append(line)
+        return "\n".join(out)
+
     def _save_memory_md(self) -> None:
-        """Write self.data back to MEMORY.md."""
+        """Write self.data back to MEMORY.md (atomically)."""
         os.makedirs(os.path.dirname(self._memory_file) or ".", exist_ok=True)
         lines = ["# Long-Term Memory\n"]
 
@@ -121,14 +138,22 @@ class MemoryStorage:
             lines.append(f"## {key}")
             lines.append(f"> Updated: {updated}")
             lines.append("")
-            lines.append(value)
+            lines.append(self._escape_value(value))
             lines.append("")
 
+        # Atomic replace — a crash mid-write must never truncate the whole store
+        tmp = self._memory_file + ".tmp"
         try:
-            with open(self._memory_file, "w", encoding="utf-8") as f:
+            with open(tmp, "w", encoding="utf-8") as f:
                 f.write("\n".join(lines))
+            os.replace(tmp, self._memory_file)
         except OSError as e:
             print(f"Error saving MEMORY.md: {e}")
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
 
     def _append_daily_log(self, key: str, value: str) -> None:
         """Append an entry to today's daily log file."""
@@ -142,6 +167,7 @@ class MemoryStorage:
                 if is_new:
                     f.write(f"# Daily Memory — {today}\n\n")
                 f.write(f"### {now} — {key}\n\n{value}\n\n")
+            self._daily_cache_ts = 0.0  # invalidate read cache
         except OSError as e:
             print(f"Error writing daily memory log: {e}")
 
@@ -196,6 +222,7 @@ class MemoryStorage:
 
     _daily_cache: str = ""
     _daily_cache_ts: float = 0.0
+    _daily_cache_days: int = 0
 
     def read_recent_daily_logs(self, days: int = 2) -> str:
         """Read the last *days* daily logs, with 60s in-memory cache."""
@@ -203,7 +230,11 @@ class MemoryStorage:
         from datetime import timedelta
 
         now = _time.monotonic()
-        if self._daily_cache and (now - self._daily_cache_ts) < 60:
+        if (
+            self._daily_cache
+            and self._daily_cache_days == days
+            and (now - self._daily_cache_ts) < 60
+        ):
             return self._daily_cache
 
         parts: list[str] = []
@@ -219,6 +250,7 @@ class MemoryStorage:
                     pass
         self._daily_cache = "\n\n---\n\n".join(parts) if parts else ""
         self._daily_cache_ts = now
+        self._daily_cache_days = days
         return self._daily_cache
 
     def read_memory_file(self, path: str) -> str:
@@ -227,8 +259,11 @@ class MemoryStorage:
         *path* is relative to the memory dir (e.g. ``MEMORY.md``,
         ``2026-03-03.md``).  Returns ``""`` if the file does not exist.
         """
-        full = os.path.normpath(os.path.join(self.memory_dir, path))
-        if not full.startswith(os.path.normpath(self.memory_dir)):
+        base = os.path.realpath(self.memory_dir)
+        full = os.path.realpath(os.path.join(self.memory_dir, path))
+        # A plain prefix check would let '../memory_evil' through — compare
+        # against the directory boundary, not the raw string.
+        if full != base and not full.startswith(base + os.sep):
             return "(access denied — path outside memory directory)"
         if not os.path.isfile(full):
             return ""

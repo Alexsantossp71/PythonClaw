@@ -93,12 +93,14 @@ class OpenAICompatibleProvider(LLMProvider):
                                 tc_delta.function.arguments
                             )
 
+        # Preserve the model's call order — sort by stream index, not by the
+        # provider-generated (effectively random) ID string.
         mock_tool_calls = [
             MockToolCall(
                 id=v["id"],
                 function=MockFunction(name=v["name"], arguments=v["args"] or "{}"),
             )
-            for v in sorted(tool_calls_acc.values(), key=lambda x: x["id"])
+            for _, v in sorted(tool_calls_acc.items())
         ]
 
         return MockResponse(choices=[

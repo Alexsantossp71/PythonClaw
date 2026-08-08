@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeout
 from datetime import datetime
@@ -46,6 +47,7 @@ from .tools import (
     KNOWLEDGE_TOOL,
     MEMORY_TOOLS,
     META_SKILL_TOOLS,
+    MULTI_SEARCH_TOOL,
     PRIMITIVE_TOOLS,
     SKILL_TOOLS,
     WEB_SEARCH_TOOL,
@@ -122,7 +124,8 @@ class Agent:
 
     MAX_TOOL_ROUNDS = 12
     MAX_PARALLEL_SKILLS = 5
-    TOOL_TIMEOUT = 300
+    TOOL_TIMEOUT = 600  # matches run_command's max timeout
+    REPEAT_CALL_LIMIT = 3
 
     def __init__(
         self,
@@ -204,6 +207,9 @@ class Agent:
 
         self.loaded_skill_names: set[str] = set()
         self.pending_injections: list[str] = []
+        # Per-session file-send callback, set by the active channel before
+        # each turn (never a process-wide global — see tools.send_file).
+        self.file_sender = None
         self.MAX_PARALLEL_SKILLS = config.get_int(
             "agent", "maxParallelSkills", default=5,
         )
@@ -338,6 +344,7 @@ Choose your approach based on task complexity:
 You decide which mode fits. Don't announce the mode name.
 
 ### Rules
+- **ALWAYS prefer `multi_search` over sequential `web_search` calls.** When you need 2+ searches, use `multi_search` with all queries at once — it runs them in parallel and is much faster. Only use single `web_search` for a truly one-off lookup.
 - Batch independent tool calls in one response (parallel execution).
 - Minimize search rounds (1-3 max). Combine queries. Don't repeat.
 - Proactively `remember` user preferences, decisions, key facts.
@@ -456,7 +463,7 @@ Don't repeat this if `bot_name` already exists in memory.
         """Assemble the full tool schema list for the current session."""
         tools = PRIMITIVE_TOOLS + SKILL_TOOLS + META_SKILL_TOOLS + MEMORY_TOOLS
         if self._web_search_enabled:
-            tools = tools + [WEB_SEARCH_TOOL]
+            tools = tools + [WEB_SEARCH_TOOL, MULTI_SEARCH_TOOL]
         if self.rag:
             tools = tools + [KNOWLEDGE_TOOL]
         if self._cron_manager:
@@ -522,6 +529,8 @@ Don't repeat this if `bot_name` already exists in memory.
             elif func_name == "create_skill":
                 result = AVAILABLE_TOOLS["create_skill"](**args)
                 self._refresh_skill_registry()
+            elif func_name == "send_file":
+                result = AVAILABLE_TOOLS["send_file"](**args, sender=self.file_sender)
             elif func_name in AVAILABLE_TOOLS:
                 result = AVAILABLE_TOOLS[func_name](**args)
             else:
@@ -533,7 +542,56 @@ Don't repeat this if `bot_name` already exists in memory.
             preview = str(result)[:200] + ("..." if len(str(result)) > 200 else "")
             logger.debug("Result: %s", preview)
 
-        return str(result)
+        from .tools import truncate_output
+        return truncate_output(str(result), label=func_name)
+
+    def _run_tool_batch(self, tool_calls: list, call_counts: Counter) -> dict[str, str]:
+        """Execute a batch of tool calls in parallel; return {tool_call_id: result}.
+
+        Two agent-loop safeguards:
+          - Loop breaker: an identical (name, arguments) call repeated more than
+            REPEAT_CALL_LIMIT times in one turn is short-circuited with an error
+            instead of executed, so the model can't burn rounds retrying itself.
+          - Non-blocking timeout: slow tools get an error result after
+            TOOL_TIMEOUT, and the executor is shut down without waiting, so a
+            hung tool can no longer freeze the whole session.
+        """
+        results: dict[str, str] = {}
+        to_run: list = []
+        for tc in tool_calls:
+            key = (tc.function.name, tc.function.arguments)
+            call_counts[key] += 1
+            if call_counts[key] > self.REPEAT_CALL_LIMIT:
+                results[tc.id] = (
+                    f"Error: identical call to '{tc.function.name}' repeated "
+                    f"{call_counts[key]} times this turn. Do NOT retry the same "
+                    "arguments — change approach or answer with what you have."
+                )
+            else:
+                to_run.append(tc)
+
+        if to_run:
+            pool = ThreadPoolExecutor(max_workers=min(len(to_run), 16))
+            futures = {pool.submit(self._execute_tool_call, tc): tc for tc in to_run}
+            try:
+                for future in as_completed(futures, timeout=self.TOOL_TIMEOUT):
+                    tc = futures[future]
+                    try:
+                        results[tc.id] = future.result()
+                    except Exception as exc:
+                        results[tc.id] = f"Error: {exc}"
+            except FuturesTimeout:
+                logger.warning("Tool batch timed out after %ds", self.TOOL_TIMEOUT)
+            finally:
+                pool.shutdown(wait=False, cancel_futures=True)
+
+        for tc in tool_calls:
+            if tc.id not in results:
+                results[tc.id] = (
+                    f"Error: tool '{tc.function.name}' timed out "
+                    f"after {self.TOOL_TIMEOUT}s"
+                )
+        return results
 
     # ── Skill registry refresh (after create_skill) ────────────────────────
 
@@ -541,6 +599,14 @@ Don't repeat this if `bot_name` already exists in memory.
         """Invalidate the registry cache so newly created skills are discovered."""
         self._registry.invalidate()
         new_catalog = self._registry.build_catalog()
+        # Keep only the latest catalog snapshot — stale copies just burn context.
+        self.messages = [
+            m for m in self.messages
+            if not (
+                m.get("role") == "system"
+                and str(m.get("content", "")).startswith("[Skill Registry Updated]")
+            )
+        ]
         self.messages.append({
             "role": "system",
             "content": (
@@ -740,10 +806,27 @@ Don't repeat this if `bot_name` already exists in memory.
         chat_msgs   = [m for m in self.messages if m.get("role") != "system"]
 
         if len(chat_msgs) > self.max_chat_history:
-            chat_msgs = chat_msgs[-self.max_chat_history:]
+            cut = len(chat_msgs) - self.max_chat_history
+            # Turn integrity: never prune the current turn.  A multi-round
+            # tool loop can generate more messages than the window holds —
+            # without this anchor the user's own question would slide out
+            # of context mid-turn.
+            for i in range(len(chat_msgs) - 1, -1, -1):
+                if chat_msgs[i].get("role") == "user":
+                    cut = min(cut, i)
+                    break
+            chat_msgs = chat_msgs[cut:]
 
         chat_msgs = self._sanitize_tool_pairs(chat_msgs)
-        return system_msgs + chat_msgs
+
+        # Strip private metadata (e.g. the _ts persistence timestamps) —
+        # OpenAI and Anthropic reject unknown message fields with a 400.
+        def _clean(m: dict) -> dict:
+            if any(k.startswith("_") for k in m):
+                return {k: v for k, v in m.items() if not k.startswith("_")}
+            return m
+
+        return [_clean(m) for m in system_msgs + chat_msgs]
 
     # ── Compaction ────────────────────────────────────────────────────────────
 
@@ -876,6 +959,7 @@ Don't repeat this if `bot_name` already exists in memory.
 
         current_tools = self._build_tools()
         tool_rounds = 0
+        call_counts: Counter = Counter()
         chat_start = time.monotonic()
 
         while True:
@@ -905,7 +989,7 @@ Don't repeat this if `bot_name` already exists in memory.
                         "elapsed_ms": int((time.monotonic() - chat_start) * 1000),
                         "response_len": len(message.content or ""),
                     })
-                    return message.content
+                    return message.content or ""
 
                 tool_rounds += 1
                 if tool_rounds > self.MAX_TOOL_ROUNDS:
@@ -937,7 +1021,7 @@ Don't repeat this if `bot_name` already exists in memory.
                         )
                         final_msg = final.choices[0].message
                         self.messages.append(final_msg.model_dump())
-                        return final_msg.content
+                        return final_msg.content or ""
                     except Exception as exc:
                         return f"Error (after hitting tool limit): {exc}"
 
@@ -957,24 +1041,7 @@ Don't repeat this if `bot_name` already exists in memory.
                 })
 
                 t0 = time.monotonic()
-                results: dict[str, str] = {}
-                with ThreadPoolExecutor(max_workers=min(len(tool_calls), 16)) as pool:
-                    futures = {
-                        pool.submit(self._execute_tool_call, tc): tc
-                        for tc in tool_calls
-                    }
-                    for future in as_completed(futures, timeout=self.TOOL_TIMEOUT):
-                        tc = futures[future]
-                        try:
-                            results[tc.id] = future.result()
-                        except Exception as exc:
-                            results[tc.id] = f"Error: {exc}"
-                for tc in tool_calls:
-                    if tc.id not in results:
-                        results[tc.id] = (
-                            f"Error: tool '{tc.function.name}' timed out "
-                            f"after {self.TOOL_TIMEOUT}s"
-                        )
+                results = self._run_tool_batch(tool_calls, call_counts)
                 _log_detail({
                     "event": "tool_results",
                     "round": tool_rounds,
@@ -993,16 +1060,6 @@ Don't repeat this if `bot_name` already exists in memory.
                     self.messages.append({"role": "system", "content": injection})
                 self.pending_injections = []
 
-            except FuturesTimeout:
-                logger.warning("Tool execution timed out at round %d", tool_rounds)
-                for tc in tool_calls:
-                    if tc.id not in results:
-                        self.messages.append({
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": f"Error: timed out after {self.TOOL_TIMEOUT}s",
-                        })
-                continue
             except Exception as exc:
                 logger.exception("Critical error in Agent.chat()")
                 return f"Error: {exc}"
@@ -1027,6 +1084,7 @@ Don't repeat this if `bot_name` already exists in memory.
 
         current_tools = self._build_tools()
         tool_rounds = 0
+        call_counts: Counter = Counter()
         chat_start = time.monotonic()
 
         while True:
@@ -1102,28 +1160,8 @@ Don't repeat this if `bot_name` already exists in memory.
                     names = ", ".join(tc.function.name for tc in tool_calls)
                     on_token(f"\n\n`[calling: {names}]`\n\n")
 
-                results: dict[str, str] = {}
-                with ThreadPoolExecutor(
-                    max_workers=min(len(tool_calls), 16),
-                ) as pool:
-                    futures = {
-                        pool.submit(self._execute_tool_call, tc): tc
-                        for tc in tool_calls
-                    }
-                    for future in as_completed(
-                        futures, timeout=self.TOOL_TIMEOUT
-                    ):
-                        tc = futures[future]
-                        try:
-                            results[tc.id] = future.result()
-                        except Exception as exc:
-                            results[tc.id] = f"Error: {exc}"
+                results = self._run_tool_batch(tool_calls, call_counts)
                 for tc in tool_calls:
-                    if tc.id not in results:
-                        results[tc.id] = (
-                            f"Error: tool '{tc.function.name}' timed out "
-                            f"after {self.TOOL_TIMEOUT}s"
-                        )
                     self.messages.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
@@ -1136,16 +1174,6 @@ Don't repeat this if `bot_name` already exists in memory.
                     )
                 self.pending_injections = []
 
-            except FuturesTimeout:
-                logger.warning("Tool execution timed out in stream round %d", tool_rounds)
-                for tc in tool_calls:
-                    if tc.id not in results:
-                        self.messages.append({
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": f"Error: timed out after {self.TOOL_TIMEOUT}s",
-                        })
-                continue
             except Exception as exc:
                 logger.exception("Critical error in Agent.chat_stream()")
                 return f"Error: {exc}"

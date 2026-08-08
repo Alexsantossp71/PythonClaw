@@ -53,6 +53,31 @@ def _get_ssl_ctx() -> ssl.SSLContext:
     return ctx
 
 
+def _extract_zip_safe(zf: zipfile.ZipFile, skill_dir: str) -> None:
+    """Extract *zf* into *skill_dir*, rejecting any member that would land
+    outside it (zip-slip: absolute paths or ``..`` traversal).
+
+    Hub ZIPs are untrusted input — a crafted member like ``foo/../../evil``
+    or ``/etc/passwd`` must never be written outside the skill directory.
+    """
+    root = os.path.realpath(skill_dir)
+    for member in zf.namelist():
+        if member.startswith("__MACOSX") or member.startswith("."):
+            continue
+        dest = os.path.realpath(os.path.join(root, member))
+        if dest != root and not dest.startswith(root + os.sep):
+            logger.warning(
+                "Skipping unsafe ZIP member %r (resolves outside skill dir)", member
+            )
+            continue
+        if member.endswith("/"):
+            os.makedirs(dest, exist_ok=True)
+        else:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, "wb") as f:
+                f.write(zf.read(member))
+
+
 def _api_get(path: str, params: dict[str, Any] | None = None) -> dict:
     """Make a GET request to the ClawHub API (no auth required)."""
     url = f"{CLAWHUB_API}{path}"
@@ -232,16 +257,7 @@ def install_skill(
                 f"ClawHub returned invalid ZIP for '{skill_id}'."
             ) from exc
 
-        for member in zf.namelist():
-            if member.startswith("__MACOSX") or member.startswith("."):
-                continue
-            dest = os.path.join(skill_dir, member)
-            if member.endswith("/"):
-                os.makedirs(dest, exist_ok=True)
-            else:
-                os.makedirs(os.path.dirname(dest), exist_ok=True)
-                with open(dest, "wb") as f:
-                    f.write(zf.read(member))
+        _extract_zip_safe(zf, skill_dir)
 
         if not os.path.exists(os.path.join(skill_dir, "SKILL.md")):
             logger.warning("No SKILL.md found in ZIP for '%s'", skill_id)
@@ -274,7 +290,7 @@ async def _api_get_async(path: str, params: dict[str, Any] | None = None) -> dic
 
     try:
         async with httpx.AsyncClient(
-            verify=False, timeout=15.0,
+            verify=_get_ssl_ctx(), timeout=15.0,
         ) as client:
             resp = await client.get(
                 url,
@@ -299,7 +315,7 @@ async def _download_skill_zip_async(slug: str) -> bytes:
     url = f"{CLAWHUB_DOWNLOAD}?slug={urllib.request.quote(slug)}"
     try:
         async with httpx.AsyncClient(
-            verify=False, timeout=30.0,
+            verify=_get_ssl_ctx(), timeout=30.0,
         ) as client:
             resp = await client.get(
                 url, headers={"User-Agent": "PythonClaw/1.0"},
@@ -378,16 +394,7 @@ async def install_skill_async(
             f"ClawHub returned invalid ZIP for '{skill_id}'."
         ) from exc
 
-    for member in zf.namelist():
-        if member.startswith("__MACOSX") or member.startswith("."):
-            continue
-        dest = os.path.join(skill_dir, member)
-        if member.endswith("/"):
-            os.makedirs(dest, exist_ok=True)
-        else:
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            with open(dest, "wb") as f:
-                f.write(zf.read(member))
+    _extract_zip_safe(zf, skill_dir)
 
     if not os.path.exists(os.path.join(skill_dir, "SKILL.md")):
         logger.warning("No SKILL.md found in ZIP for '%s'", skill_id)

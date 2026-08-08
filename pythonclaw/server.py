@@ -71,9 +71,19 @@ async def start_channels(
         try:
             from .channels.discord_bot import create_bot_from_env as create_discord
             discord_bot = create_discord(session_manager)
-            asyncio.create_task(discord_bot.start_async())
+            # client.start() blocks for the bot's lifetime, so it must be a
+            # task — but keep a reference and surface failures (a bad token
+            # would otherwise vanish into an unretrieved-task warning).
+            task = asyncio.create_task(discord_bot.start_async())
+            discord_bot._start_task = task
+
+            def _log_discord_exit(t: "asyncio.Task") -> None:
+                if not t.cancelled() and t.exception() is not None:
+                    logger.error("[Server] Discord bot crashed: %s", t.exception())
+
+            task.add_done_callback(_log_discord_exit)
             active_bots.append(discord_bot)
-            logger.info("[Server] Discord bot started.")
+            logger.info("[Server] Discord bot starting…")
         except Exception as exc:
             logger.warning("[Server] Discord channel failed to start: %s", exc)
 

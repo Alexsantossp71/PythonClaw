@@ -97,13 +97,8 @@ class DiscordBot:
 
     @staticmethod
     def _split_message(text: str, limit: int = MAX_MSG_LEN) -> list[str]:
-        if len(text) <= limit:
-            return [text]
-        chunks = []
-        while text:
-            chunks.append(text[:limit])
-            text = text[limit:]
-        return chunks
+        from ..core.utils import split_message
+        return split_message(text, limit)
 
     # ── Handlers ──────────────────────────────────────────────────────────────
 
@@ -125,11 +120,14 @@ class DiscordBot:
             is_mentioned = client.user in message.mentions if not is_dm else False
 
             if not is_dm:
+                # Channel allowlist applies to ALL guild messages — a mention
+                # must not bypass it.
+                if not self._is_allowed_channel(message.channel.id):
+                    return
                 if self._require_mention and not is_mentioned:
                     return
                 if not self._require_mention and not is_mentioned:
-                    if not self._is_allowed_channel(message.channel.id):
-                        return
+                    return
 
             if not self._is_allowed_user(message.author.id):
                 await message.reply("Sorry, you are not authorised to use this bot.")
@@ -137,7 +135,11 @@ class DiscordBot:
 
             content = message.content.strip()
             if is_mentioned and client.user:
-                content = content.replace(f"<@{client.user.id}>", "").strip()
+                content = (
+                    content.replace(f"<@{client.user.id}>", "")
+                    .replace(f"<@!{client.user.id}>", "")
+                    .strip()
+                )
 
             has_image = any(
                 a.content_type and a.content_type.startswith("image/")
@@ -271,12 +273,17 @@ class DiscordBot:
         agent = self._sm.get_or_create(sid)
         await message.reply("Compacting conversation history...")
         try:
-            result = agent.compact(instruction=hint)
+            # Blocking LLM call — keep it off the event loop and serialize
+            # against any in-flight chat for this session.
+            async with self._sm.acquire(sid):
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(
+                    None, lambda: agent.compact(instruction=hint)
+                )
         except Exception as exc:
             logger.exception("[Discord] compact() raised an exception")
             result = f"Compaction failed: {exc}"
-        for chunk in self._split_message(result or "(no result)"):
-            await message.reply(chunk)
+        await self._reply_chunks(message, result or "(no result)")
 
     async def _handle_chat(
         self,
@@ -294,38 +301,52 @@ class DiscordBot:
             try:
                 async with self._sm.acquire(sid):
                     loop = asyncio.get_event_loop()
-                    self._register_file_sender(loop, message.channel)
+                    # Per-agent sender — a process-wide global would race
+                    # across channels and deliver files to the wrong chat.
+                    agent.file_sender = self._make_file_sender(loop, message.channel)
                     response = await loop.run_in_executor(None, agent.chat, content)
             except Exception as exc:
                 logger.exception("[Discord] Agent.chat() raised an exception")
                 response = f"Sorry, something went wrong: {exc}"
-        for chunk in self._split_message(response or "(no response)"):
-            await message.reply(chunk)
+        await self._reply_chunks(message, response or "(no response)")
+
+    async def _reply_chunks(self, message: discord.Message, text: str) -> None:
+        """Reply in chunks; one failed chunk must not drop the rest.
+
+        Falls back to ``channel.send`` when the reply reference is gone
+        (e.g. the user deleted their message during a long agent run).
+        """
+        for chunk in self._split_message(text):
+            if not chunk.strip():
+                continue
+            try:
+                await message.reply(chunk)
+            except Exception:
+                try:
+                    await message.channel.send(chunk)
+                except Exception:
+                    logger.warning("[Discord] chunk delivery failed", exc_info=True)
 
     # ── File sending ──────────────────────────────────────────────────────────
 
-    def _register_file_sender(
+    def _make_file_sender(
         self,
         loop: asyncio.AbstractEventLoop,
         channel: discord.abc.Messageable,
-    ) -> None:
-        """Register a sync callback so the Agent can send files via Discord."""
-        from ..core.tools import set_file_sender
+    ):
+        """Build a sync callback so the Agent can send files via Discord."""
 
         def _sender(path: str, caption: str = "") -> None:
             async def _do_send():
-                try:
-                    await channel.send(
-                        content=caption[:2000] if caption else None,
-                        file=discord.File(path),
-                    )
-                except Exception as exc:
-                    logger.warning("[Discord] send_file failed: %s", exc)
+                await channel.send(
+                    content=caption[:2000] if caption else None,
+                    file=discord.File(path),
+                )
 
             future = asyncio.run_coroutine_threadsafe(_do_send(), loop)
             future.result(timeout=60)
 
-        set_file_sender(_sender)
+        return _sender
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 

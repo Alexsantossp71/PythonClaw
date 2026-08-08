@@ -307,6 +307,35 @@ class CronScheduler:
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
+_CRON_DOW_NAMES = ("sun", "mon", "tue", "wed", "thu", "fri", "sat")
+
+
+def _convert_dow(field: str) -> str:
+    """Translate Unix-cron day-of-week numbers to APScheduler weekday names.
+
+    Standard cron uses 0=Sunday…6=Saturday (7 also Sunday), but APScheduler's
+    CronTrigger uses 0=Monday…6=Sunday — passing numeric tokens through
+    unchanged makes every schedule fire one day late ('0 9 * * 1-5' would
+    run Tue–Sat instead of Mon–Fri).
+    """
+    def tok(t: str) -> str:
+        return _CRON_DOW_NAMES[int(t) % 7] if t.isdigit() else t
+
+    def rng(r: str) -> str:
+        if r == "*":
+            return r
+        if "-" in r:
+            a, _, b = r.partition("-")
+            return f"{tok(a)}-{tok(b)}"
+        return tok(r)
+
+    out = []
+    for part in field.split(","):
+        base, sep, step = part.partition("/")
+        out.append(f"{rng(base)}{sep}{step}")
+    return ",".join(out)
+
+
 def _parse_cron(expr: str) -> CronTrigger:
     """Convert a 5-field cron expression string into an APScheduler CronTrigger."""
     parts = expr.strip().split()
@@ -318,5 +347,5 @@ def _parse_cron(expr: str) -> CronTrigger:
         hour=hour,
         day=day,
         month=month,
-        day_of_week=day_of_week,
+        day_of_week=_convert_dow(day_of_week),
     )

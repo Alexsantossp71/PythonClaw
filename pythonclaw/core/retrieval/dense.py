@@ -61,13 +61,19 @@ class _SentenceTransformersBackend:
     def fit(self, corpus: list[dict]) -> None:
         self._corpus = corpus
         texts = [c["content"] for c in corpus]
-        self._embeddings = self._model.encode(texts, show_progress_bar=False, convert_to_numpy=True)
+        self._embeddings = self._model.encode(
+            texts, show_progress_bar=False, convert_to_numpy=True,
+            normalize_embeddings=True,
+        )
 
     def retrieve(self, query: str, top_k: int) -> list[tuple[float, dict]]:
         if self._embeddings is None or not self._corpus:
             return []
-        q_emb = self._model.encode([query], convert_to_numpy=True)
-        # Cosine similarity (embeddings are L2-normalised by default in ST)
+        q_emb = self._model.encode(
+            [query], convert_to_numpy=True, normalize_embeddings=True,
+        )
+        # True cosine similarity — both sides are explicitly L2-normalised
+        # (ST does NOT normalise by default).
         sims = (self._embeddings @ q_emb.T).flatten()
         ranked = sorted(
             zip(sims.tolist(), self._corpus), key=lambda x: x[0], reverse=True
@@ -89,7 +95,13 @@ class _TfidfBackend:
             return
         texts = [c["content"] for c in corpus]
         self._vec = TfidfVectorizer(analyzer="word", min_df=1, stop_words=None)
-        self._matrix = self._vec.fit_transform(texts)
+        try:
+            self._matrix = self._vec.fit_transform(texts)
+        except ValueError:
+            # Degenerate corpus (e.g. punctuation-only chunks) → empty
+            # vocabulary; treat as "no dense hits" instead of crashing.
+            self._vec = None
+            self._matrix = None
 
     def retrieve(self, query: str, top_k: int) -> list[tuple[float, dict]]:
         if self._vec is None or not self._corpus:

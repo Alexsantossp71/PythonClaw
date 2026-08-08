@@ -39,6 +39,7 @@ from __future__ import annotations
 import base64
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
 from .. import config
@@ -79,6 +80,11 @@ class WhatsAppBot:
         self._require_mention = require_mention
         self._wa = None  # set in mount()
         self._locks: dict[str, threading.Lock] = {}
+        self._locks_guard = threading.Lock()
+        # Webhook handlers must return fast — Meta retries deliveries that
+        # don't get a 200 quickly, and pywa calls handlers synchronously on
+        # AnyIO worker threads. Heavy agent work runs on this pool instead.
+        self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="wa-agent")
 
     # ── Session ID convention ─────────────────────────────────────────────────
 
@@ -94,27 +100,29 @@ class WhatsAppBot:
         return wa_id in self._allowed_numbers
 
     def _get_lock(self, session_id: str) -> threading.Lock:
-        if session_id not in self._locks:
-            self._locks[session_id] = threading.Lock()
-        return self._locks[session_id]
+        # Two rapid webhooks for the same user arrive on different worker
+        # threads — without the guard both could create distinct locks and
+        # interleave agent history.
+        lock = self._locks.get(session_id)
+        if lock is None:
+            with self._locks_guard:
+                lock = self._locks.setdefault(session_id, threading.Lock())
+        return lock
 
     # ── File sending ──────────────────────────────────────────────────────────
 
-    def _register_file_sender(self, client, wa_id: str) -> None:
-        """Register a sync callback so the Agent can send files via WhatsApp."""
-        from ..core.tools import set_file_sender
+    @staticmethod
+    def _make_file_sender(client, wa_id: str):
+        """Build a sync callback so the Agent can send files via WhatsApp."""
 
         def _sender(path: str, caption: str = "") -> None:
-            try:
-                client.send_document(
-                    to=wa_id,
-                    document=path,
-                    caption=caption[:1024] if caption else None,
-                )
-            except Exception as exc:
-                logger.warning("[WhatsApp] send_file failed: %s", exc)
+            client.send_document(
+                to=wa_id,
+                document=path,
+                caption=caption[:1024] if caption else None,
+            )
 
-        set_file_sender(_sender)
+        return _sender
 
     # ── Mount on FastAPI ──────────────────────────────────────────────────────
 
@@ -144,6 +152,16 @@ class WhatsAppBot:
 
         @wa.on_message
         def _on_message(client: WhatsApp, msg: types.Message) -> None:
+            # Hand off immediately — blocking the webhook thread for the whole
+            # agent run starves the AnyIO pool and triggers Meta redeliveries.
+            bot._executor.submit(bot._process_message, client, msg)
+
+        logger.info("[WhatsApp] Webhook handler mounted on FastAPI app")
+
+    def _process_message(self, client, msg) -> None:
+        """Full message handling — runs on the bot's worker pool."""
+        bot = self
+        try:
             wa_id = msg.from_user.wa_id
             if not bot._is_allowed(wa_id):
                 msg.reply("Sorry, you are not authorised to use this bot.")
@@ -201,7 +219,8 @@ class WhatsAppBot:
                 hint = text[len("!compact"):].strip() or None
                 msg.reply("Compacting conversation history...")
                 try:
-                    result = agent.compact(instruction=hint)
+                    with bot._get_lock(sid):
+                        result = agent.compact(instruction=hint)
                 except Exception as exc:
                     result = f"Compaction failed: {exc}"
                 for chunk in _split_message(result):
@@ -217,18 +236,23 @@ class WhatsAppBot:
             # Build input (text or multimodal)
             chat_input = text or "What's in this image?"
             if has_image:
-                chat_input = _build_wa_image_input(
+                image_input = _build_wa_image_input(
                     client, msg, text or "What's in this image?"
                 )
+                if image_input is None:
+                    msg.reply("Sorry, I couldn't download that image — please try again.")
+                    return
+                chat_input = image_input
 
             lock = bot._get_lock(sid)
             if lock.locked():
                 msg.reply("Processing previous message...")
 
-            bot._register_file_sender(client, wa_id)
-
             try:
                 with lock:
+                    # Per-agent sender — set under the lock so concurrent
+                    # sessions can't cross-deliver files.
+                    agent.file_sender = bot._make_file_sender(client, wa_id)
                     response = agent.chat(chat_input)
             except Exception as exc:
                 logger.exception("[WhatsApp] Agent.chat() raised an exception")
@@ -236,8 +260,12 @@ class WhatsAppBot:
 
             for chunk in _split_message(response or "(no response)"):
                 msg.reply(chunk)
-
-        logger.info("[WhatsApp] Webhook handler mounted on FastAPI app")
+        except Exception:
+            logger.exception("[WhatsApp] Unhandled error while processing message")
+            try:
+                msg.reply("Sorry, something went wrong while processing your message.")
+            except Exception:
+                pass
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -253,18 +281,17 @@ class WhatsAppBot:
 # ── Utility ───────────────────────────────────────────────────────────────────
 
 def _split_message(text: str, limit: int = 4096) -> list[str]:
-    """Split a long string into WhatsApp-safe chunks."""
-    if len(text) <= limit:
-        return [text]
-    chunks = []
-    while text:
-        chunks.append(text[:limit])
-        text = text[limit:]
-    return chunks
+    """Split a long string into WhatsApp-safe chunks at natural boundaries."""
+    from ..core.utils import split_message
+    return split_message(text, limit)
 
 
-def _build_wa_image_input(client, msg, caption: str) -> list:
-    """Download WhatsApp image and build multimodal content array."""
+def _build_wa_image_input(client, msg, caption: str) -> list | None:
+    """Download WhatsApp image and build multimodal content array.
+
+    Returns ``None`` when the download fails — the caller must tell the
+    user instead of silently asking the LLM about an image it never got.
+    """
     try:
         image = msg.image
         data = image.download(in_memory=True)
@@ -281,7 +308,7 @@ def _build_wa_image_input(client, msg, caption: str) -> list:
         ]
     except Exception:
         logger.warning("[WhatsApp] Failed to download image")
-        return caption
+        return None
 
 
 def _transcribe_wa_audio(client, msg) -> str | None:

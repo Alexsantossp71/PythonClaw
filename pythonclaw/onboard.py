@@ -359,7 +359,8 @@ def _save_config(cfg: dict, config_path: str | None) -> Path:
     cfg.setdefault("deepgram", {}).setdefault("apiKey", "")
     cfg.setdefault("heartbeat", {"intervalSec": 60, "alertChatId": None})
     cfg.setdefault("memory", {"dir": None})
-    cfg.setdefault("web", {"host": "0.0.0.0", "port": 7788})
+    # Loopback by default — the dashboard has full agent (and shell) access.
+    cfg.setdefault("web", {"host": "127.0.0.1", "port": 7788})
     cfg.setdefault("skills", {})
     cfg.setdefault("agent", {"autoCompactThreshold": 0, "verbose": True})
     cfg.setdefault("isolation", {"perGroup": False})

@@ -139,7 +139,48 @@ def _files_dir() -> str:
     return str(_cfg.files_dir())
 
 
-def run_command(command: str) -> str:
+# Context engineering: a single oversized tool result can crowd everything
+# else out of the context window.  Outputs beyond this limit are truncated
+# head+tail; the full text is spilled to a file the agent can page through
+# with read_file(offset=...).
+MAX_TOOL_OUTPUT_CHARS = 12_000
+
+
+def _spill_dir() -> str:
+    from .. import config as _cfg
+    d = os.path.join(str(_cfg.PYTHONCLAW_HOME), "context", "files", "tool_outputs")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def truncate_output(text: str, label: str = "output", limit: int | None = None) -> str:
+    """Cap *text* at *limit* chars, keeping head + tail and spilling the
+    full text to a file so nothing is lost."""
+    limit = limit or MAX_TOOL_OUTPUT_CHARS
+    if len(text) <= limit:
+        return text
+
+    spill_path = ""
+    try:
+        import time as _time
+        fname = f"{int(_time.time() * 1000)}_{_sanitize_filename(label)[:40]}.txt"
+        spill_path = os.path.join(_spill_dir(), fname)
+        with open(spill_path, "w", encoding="utf-8") as f:
+            f.write(text)
+    except Exception:
+        spill_path = ""
+
+    head = text[: limit * 2 // 3]
+    tail = text[-(limit // 3):]
+    note = (
+        f"\n\n... [{len(text) - limit:,} chars truncated"
+        + (f" — full output saved to {spill_path}; use read_file with offset/limit to page through it" if spill_path else "")
+        + "] ...\n\n"
+    )
+    return head + note + tail
+
+
+def run_command(command: str, timeout: int = 120) -> str:
     """Execute a shell command and return combined stdout/stderr.
 
     The command inherits the project's virtual environment so that
@@ -147,23 +188,50 @@ def run_command(command: str) -> str:
     The working directory is set to ``~/.pythonclaw/context/files/`` so
     that any files created or downloaded by the command land there.
     """
+    timeout = max(1, min(int(timeout or 120), 600))
     try:
         result = subprocess.run(
             command, shell=True, capture_output=True, text=True,
-            timeout=60, env=_venv_env(), cwd=_files_dir(),
+            timeout=timeout, env=_venv_env(), cwd=_files_dir(),
         )
-        return result.stdout if result.returncode == 0 else f"Error (exit {result.returncode}):\n{result.stderr}"
+        if result.returncode == 0:
+            out = result.stdout
+            if result.stderr.strip():
+                out += f"\n[stderr]\n{result.stderr}"
+            return truncate_output(out, label="run_command")
+        return truncate_output(
+            f"Error (exit {result.returncode}):\n{result.stderr}\n{result.stdout}",
+            label="run_command",
+        )
+    except subprocess.TimeoutExpired:
+        return (
+            f"Error: command timed out after {timeout}s. "
+            "Pass a larger `timeout` (max 600) for long-running commands, "
+            "or run it in the background with `nohup ... &`."
+        )
     except Exception as exc:
         return f"Execution error: {exc}"
 
 
-def read_file(path: str) -> str:
-    """Read and return the contents of a file."""
+def read_file(path: str, offset: int = 0, limit: int = 0) -> str:
+    """Read a file, optionally a slice of lines (offset/limit, 1-based offset).
+
+    Large files are truncated head+tail so a single read can never flood the
+    context window; use offset/limit to page through the rest.
+    """
     try:
         if not os.path.exists(path):
             return f"Error: '{path}' not found."
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read()
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            if offset or limit:
+                lines = f.readlines()
+                start = max(int(offset) - 1, 0) if offset else 0
+                end = start + int(limit) if limit else len(lines)
+                slice_ = lines[start:end]
+                if not slice_:
+                    return f"(no lines in range {start + 1}..{end} — file has {len(lines)} lines)"
+                return truncate_output("".join(slice_), label="read_file")
+            return truncate_output(f.read(), label="read_file")
     except Exception as exc:
         return f"Read error: {exc}"
 
@@ -207,8 +275,13 @@ def set_file_sender(fn: callable | None) -> None:
     _file_sender = fn
 
 
-def send_file(path: str, caption: str = "") -> str:
-    """Send a file to the user via the active channel (Telegram/Discord/WhatsApp/Web)."""
+def send_file(path: str, caption: str = "", sender: "callable | None" = None) -> str:
+    """Send a file to the user via the active channel (Telegram/Discord/WhatsApp/Web).
+
+    *sender* is the per-session callback (``agent.file_sender``); the module
+    global is only a legacy fallback — a global alone would race across
+    concurrent sessions and deliver files to the wrong chat.
+    """
     resolved = os.path.realpath(os.path.abspath(path))
     if not os.path.isfile(resolved):
         return f"Error: file not found: {path}"
@@ -218,14 +291,15 @@ def send_file(path: str, caption: str = "") -> str:
         size_mb = size / (1024 * 1024)
         return f"Error: file too large ({size_mb:.1f} MB). Maximum allowed is 100 MB."
 
-    if _file_sender is None:
+    active_sender = sender or _file_sender
+    if active_sender is None:
         return (
             f"File ready at: {resolved} ({size / 1024:.1f} KB). "
             "No active channel to send through — user can download it directly."
         )
 
     try:
-        _file_sender(resolved, caption)
+        active_sender(resolved, caption)
         name = os.path.basename(resolved)
         return f"File '{name}' ({size / 1024:.1f} KB) sent successfully."
     except Exception as exc:
@@ -267,13 +341,27 @@ PRIMITIVE_TOOLS: list[dict] = [
     _fn(
         "run_command",
         "Execute a shell command. Use to run scripts, install packages, or perform system operations.",
-        {"command": {"type": "string", "description": "The shell command to execute."}},
+        {
+            "command": {"type": "string", "description": "The shell command to execute."},
+            "timeout": {
+                "type": "integer",
+                "description": "Seconds before the command is killed (default 120, max 600). Raise for long installs/builds.",
+                "default": 120,
+            },
+        },
         ["command"],
     ),
     _fn(
         "read_file",
-        "Read the contents of a file. Use to inspect code, logs, or data.",
-        {"path": {"type": "string", "description": "Path to the file."}},
+        (
+            "Read the contents of a file. Use to inspect code, logs, or data. "
+            "Long files are truncated; pass offset/limit to page through them."
+        ),
+        {
+            "path": {"type": "string", "description": "Path to the file."},
+            "offset": {"type": "integer", "description": "1-based line number to start reading from (optional)."},
+            "limit": {"type": "integer", "description": "Number of lines to read from offset (optional)."},
+        },
         ["path"],
     ),
     _fn(
@@ -481,7 +569,93 @@ def web_search(
     return "\n".join(parts)
 
 
+def multi_search(
+    queries: list[str],
+    *,
+    search_depth: str = "basic",
+    topic: str = "general",
+    max_results: int = 3,
+    time_range: str | None = None,
+) -> str:
+    """Execute multiple web searches in parallel and return combined results.
+
+    Significantly faster than sequential web_search calls when you need to
+    research multiple aspects of a topic simultaneously.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import TimeoutError as FuturesTimeout
+
+    client = _get_tavily_client()
+    if client is None:
+        return "Error: Tavily API key not configured"
+
+    if not queries:
+        return "Error: no queries provided"
+
+    def _single(q: str) -> tuple[str, str]:
+        try:
+            kwargs: dict = {
+                "query": q,
+                "search_depth": search_depth,
+                "topic": topic,
+                "max_results": max_results,
+                "include_answer": True,
+            }
+            if time_range:
+                kwargs["time_range"] = time_range
+            resp = client.search(**kwargs)
+
+            parts: list[str] = []
+            answer = resp.get("answer")
+            if answer:
+                parts.append(f"**Summary:** {answer}")
+            for i, r in enumerate(resp.get("results", []), 1):
+                title = r.get("title", "Untitled")
+                url = r.get("url", "")
+                content = r.get("content", "")
+                if len(content) > 300:
+                    content = content[:300] + "..."
+                parts.append(f"{i}. [{title}]({url})\n   {content}")
+            return q, "\n".join(parts) if parts else "No results."
+        except Exception as exc:
+            return q, f"Search error: {exc}"
+
+    all_results: list[tuple[str, str]] = []
+    pool = ThreadPoolExecutor(max_workers=min(len(queries), 8))
+    futures = {pool.submit(_single, q): q for q in queries}
+    try:
+        for future in as_completed(futures, timeout=45):
+            try:
+                all_results.append(future.result())
+            except Exception as exc:
+                all_results.append((futures[future], f"Error: {exc}"))
+    except FuturesTimeout:
+        reported = {q for q, _ in all_results}
+        for f, q in futures.items():
+            if q in reported:
+                continue
+            if f.done() and not f.cancelled():
+                try:
+                    all_results.append(f.result())
+                except Exception as exc:
+                    all_results.append((q, f"Error: {exc}"))
+            else:
+                all_results.append((q, "Error: search timed out after 45s"))
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    query_order = {q: i for i, q in enumerate(queries)}
+    all_results.sort(key=lambda x: query_order.get(x[0], 999))
+
+    output: list[str] = []
+    for q, result in all_results:
+        output.append(f"### Query: {q}\n{result}")
+
+    return "\n\n---\n\n".join(output)
+
+
 AVAILABLE_TOOLS["web_search"] = web_search
+AVAILABLE_TOOLS["multi_search"] = multi_search
 
 
 WEB_SEARCH_TOOL: dict = _fn(
@@ -520,6 +694,46 @@ WEB_SEARCH_TOOL: dict = _fn(
         },
     },
     ["query"],
+)
+
+MULTI_SEARCH_TOOL: dict = _fn(
+    "multi_search",
+    (
+        "Execute multiple web searches IN PARALLEL and return combined results. "
+        "Much faster than calling web_search multiple times sequentially. "
+        "Use this whenever you need to research 2+ different queries, compare "
+        "multiple topics, or gather information from different angles at once."
+    ),
+    {
+        "queries": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "List of search queries to execute in parallel (2-6 queries recommended).",
+        },
+        "search_depth": {
+            "type": "string",
+            "enum": ["basic", "advanced"],
+            "description": "Search depth for all queries.",
+            "default": "basic",
+        },
+        "topic": {
+            "type": "string",
+            "enum": ["general", "news", "finance"],
+            "description": "Search category for all queries.",
+            "default": "general",
+        },
+        "max_results": {
+            "type": "integer",
+            "description": "Results per query (1-5).",
+            "default": 3,
+        },
+        "time_range": {
+            "type": "string",
+            "enum": ["day", "week", "month", "year"],
+            "description": "Filter results by recency. Omit for no time filter.",
+        },
+    },
+    ["queries"],
 )
 
 

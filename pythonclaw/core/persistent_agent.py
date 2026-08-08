@@ -97,6 +97,15 @@ class PersistentAgent(Agent):
             return
         if not boot_mem:
             return
+        # Drop refreshes persisted by earlier restores — every restart would
+        # otherwise stack another stale ~2000-char snapshot into the context.
+        self.messages = [
+            m for m in self.messages
+            if not (
+                m.get("role") == "system"
+                and str(m.get("content", "")).startswith("[Memory Refresh")
+            )
+        ]
         self.messages.append({
             "role": "system",
             "content": (
@@ -124,10 +133,19 @@ class PersistentAgent(Agent):
             self._ensure_ts(msg)
         self._store.save(self._session_id, self.messages)
 
-    def chat(self, user_input: str) -> str:
-        response = super().chat(user_input)
-        self._save()
-        return response
+    def chat(self, user_input: str | list, **kwargs) -> str:
+        try:
+            return super().chat(user_input, **kwargs)
+        finally:
+            self._save()
+
+    def chat_stream(self, user_input: str | list, on_token: object = None) -> str:
+        # Telegram and the web dashboard stream — without this override
+        # their conversations were never persisted and vanished on restart.
+        try:
+            return super().chat_stream(user_input, on_token)
+        finally:
+            self._save()
 
     def compact(self, instruction: str | None = None) -> str:
         result = super().compact(instruction)

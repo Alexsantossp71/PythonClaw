@@ -56,8 +56,34 @@ COMPACTION_LOG_FILE = None  # resolved lazily
 # ── Token estimation ──────────────────────────────────────────────────────────
 
 def estimate_tokens(messages: list[dict]) -> int:
-    """Rough character-based token estimate for a list of messages."""
-    total_chars = sum(len(str(m.get("content") or "")) for m in messages)
+    """Rough character-based token estimate for a list of messages.
+
+    Counts message content AND tool-call arguments — a ``write_file`` call
+    can carry tens of KB in its arguments with ``content: None``, and
+    ignoring it would keep auto-compaction from ever firing.
+    """
+    total_chars = 0
+    for m in messages:
+        content = m.get("content") or ""
+        if isinstance(content, list):
+            # Multimodal array: count text parts, flat-rate the images —
+            # stringifying a base64 photo would count ~170k phantom tokens
+            # and trip auto-compaction on every turn.
+            for p in content:
+                if isinstance(p, dict) and p.get("type") == "text":
+                    total_chars += len(p.get("text", ""))
+                elif isinstance(p, dict):
+                    total_chars += 6400  # ≈1.6k tokens per image
+        else:
+            total_chars += len(str(content))
+        for tc in m.get("tool_calls") or []:
+            if isinstance(tc, dict):
+                fn = tc.get("function") or {}
+                total_chars += len(str(fn.get("arguments") or "")) + len(str(fn.get("name") or ""))
+            else:
+                fn = getattr(tc, "function", None)
+                if fn is not None:
+                    total_chars += len(getattr(fn, "arguments", "") or "") + len(getattr(fn, "name", "") or "")
     return total_chars // CHARS_PER_TOKEN
 
 
@@ -85,6 +111,20 @@ def messages_to_text(messages: list[dict]) -> str:
     for m in messages:
         role = m.get("role", "?")
         content = m.get("content") or ""
+        if isinstance(content, list):
+            # Multimodal content array — keep the text parts, never dump
+            # base64 image payloads into a summarisation prompt.
+            text_parts = [
+                p.get("text", "") for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            ]
+            n_images = sum(
+                1 for p in content
+                if isinstance(p, dict) and p.get("type") in ("image_url", "image")
+            )
+            content = "\n".join(t for t in text_parts if t)
+            if n_images:
+                content = (content + f"\n[{n_images} image(s) attached]").strip()
         if role == "assistant" and not content and m.get("tool_calls"):
             content = f"[called tools: {[tc.get('function', {}).get('name') if isinstance(tc, dict) else tc.function.name for tc in m.get('tool_calls', [])]}]"
         if role == "tool":
@@ -181,8 +221,19 @@ def compact(
         logger.info("[Compaction] Not enough history to compact (%d messages).", len(chat_msgs))
         return messages, ""
 
-    to_summarise = chat_msgs[:-recent_keep]
-    to_keep      = chat_msgs[-recent_keep:]
+    # Pair safety: never split an assistant tool_calls message from its tool
+    # results.  If the boundary lands on a tool message, walk it back until
+    # to_keep starts at the assistant that issued the calls (or a user turn).
+    split = len(chat_msgs) - recent_keep
+    while split > 0 and chat_msgs[split].get("role") == "tool":
+        split -= 1
+
+    to_summarise = chat_msgs[:split]
+    to_keep      = chat_msgs[split:]
+
+    if not to_summarise:
+        logger.info("[Compaction] Nothing to compact after pair-safe adjustment.")
+        return messages, ""
 
     logger.info(
         "[Compaction] Summarising %d message(s), keeping %d recent.",
@@ -216,7 +267,19 @@ def compact(
     # 3. Persist
     persist_compaction(summary, len(to_summarise), log_path=log_path)
 
-    # 4. Build new message list
+    # 4. Build new message list.  Old compaction summaries are rolled off
+    #    (keep the most recent one besides the new entry) — their durable
+    #    facts were already flushed to long-term memory, and letting them
+    #    stack up would grow the system context without bound.
+    MAX_PRIOR_SUMMARIES = 1
+    prior_summaries = [
+        m for m in system_msgs
+        if str(m.get("content", "")).startswith("[Compaction Summary")
+    ]
+    if len(prior_summaries) > MAX_PRIOR_SUMMARIES:
+        drop = set(id(m) for m in prior_summaries[:-MAX_PRIOR_SUMMARIES])
+        system_msgs = [m for m in system_msgs if id(m) not in drop]
+
     summary_system_msg = {
         "role": "system",
         "content": f"[Compaction Summary — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}]\n{summary}",

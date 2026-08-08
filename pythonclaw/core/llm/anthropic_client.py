@@ -27,14 +27,15 @@ class AnthropicProvider(LLMProvider):
     supports_images = True
 
     def __init__(self, api_key: str, model_name: str = "claude-sonnet-4-20250514"):
-        self.client = anthropic.Anthropic(
-            api_key=api_key,
-            timeout=300.0,
-        )
+        if api_key.startswith("sk-ant-oat"):
+            # OAuth tokens from `claude setup-token` must be sent as
+            # `Authorization: Bearer` (auth_token), not x-api-key.
+            self.client = anthropic.Anthropic(auth_token=api_key, timeout=300.0)
+            self._auth_type = "setup-token"
+        else:
+            self.client = anthropic.Anthropic(api_key=api_key, timeout=300.0)
+            self._auth_type = "api-key"
         self.model_name = model_name
-        self._auth_type = (
-            "setup-token" if not api_key.startswith("sk-ant-") else "api-key"
-        )
 
     # ── shared helpers ────────────────────────────────────────────────────
 
@@ -63,7 +64,7 @@ class AnthropicProvider(LLMProvider):
                     }],
                 })
 
-            elif msg["role"] == "assistant" and "tool_calls" in msg:
+            elif msg["role"] == "assistant" and msg.get("tool_calls"):
                 content_block: list[dict] = []
                 if msg.get("content"):
                     content_block.append({"type": "text", "text": msg["content"]})
@@ -71,9 +72,13 @@ class AnthropicProvider(LLMProvider):
                     tc_id = tc["id"] if isinstance(tc, dict) else tc.id
                     func = tc["function"] if isinstance(tc, dict) else tc.function
                     fname = func["name"] if isinstance(func, dict) else func.name
-                    fargs = json.loads(
-                        func["arguments"] if isinstance(func, dict) else func.arguments
-                    )
+                    raw_args = func["arguments"] if isinstance(func, dict) else func.arguments
+                    try:
+                        fargs = json.loads(raw_args) if raw_args else {}
+                    except (json.JSONDecodeError, TypeError):
+                        # A stream truncated mid-tool-input persists partial
+                        # JSON; crashing here would brick the session forever.
+                        fargs = {}
                     content_block.append({
                         "type": "tool_use",
                         "id": tc_id,
@@ -89,6 +94,9 @@ class AnthropicProvider(LLMProvider):
                 })
 
             else:
+                # Anthropic rejects empty assistant turns on replay
+                if msg["role"] == "assistant" and not msg.get("content"):
+                    continue
                 filtered_messages.append(msg)
 
         filtered_messages = self._merge_consecutive(filtered_messages)
@@ -116,7 +124,9 @@ class AnthropicProvider(LLMProvider):
             if tool_choice == "required":
                 api_kwargs["tool_choice"] = {"type": "any"}
             elif tool_choice == "none":
-                pass
+                # Must be explicit — omitting it defaults to auto, and the
+                # "answer now" path after MAX_TOOL_ROUNDS relies on this.
+                api_kwargs["tool_choice"] = {"type": "none"}
             else:
                 api_kwargs["tool_choice"] = {"type": "auto"}
 
@@ -129,7 +139,7 @@ class AnthropicProvider(LLMProvider):
     ) -> MockResponse:
         return MockResponse(choices=[
             MockChoice(message=MockMessage(
-                content=content_text or None,
+                content=content_text or "",
                 tool_calls=tool_calls or None,
             ))
         ])
@@ -202,11 +212,19 @@ class AnthropicProvider(LLMProvider):
                             current_tool["args"] += delta.partial_json
                 elif event.type == "content_block_stop":
                     if current_tool is not None:
+                        args = current_tool["args"] or "{}"
+                        try:
+                            json.loads(args)
+                        except json.JSONDecodeError:
+                            # Stream cut mid-input (e.g. max_tokens) — never
+                            # let truncated JSON enter history; it would
+                            # poison every subsequent replay.
+                            args = "{}"
                         tool_calls.append(MockToolCall(
                             id=current_tool["id"],
                             function=MockFunction(
                                 name=current_tool["name"],
-                                arguments=current_tool["args"] or "{}",
+                                arguments=args,
                             ),
                         ))
                         current_tool = None
@@ -281,17 +299,16 @@ class AnthropicProvider(LLMProvider):
                 prev_content = merged[-1].get("content", "")
                 curr_content = msg.get("content", "")
                 if isinstance(prev_content, str) and isinstance(curr_content, str):
-                    merged[-1]["content"] = prev_content + "\n" + curr_content
+                    new_content = prev_content + "\n" + curr_content
                 elif isinstance(prev_content, list) and isinstance(curr_content, list):
-                    merged[-1]["content"] = prev_content + curr_content
+                    new_content = prev_content + curr_content
                 elif isinstance(prev_content, str) and isinstance(curr_content, list):
-                    merged[-1]["content"] = [
-                        {"type": "text", "text": prev_content}
-                    ] + curr_content
-                elif isinstance(prev_content, list) and isinstance(curr_content, str):
-                    merged[-1]["content"] = prev_content + [
-                        {"type": "text", "text": curr_content}
-                    ]
+                    new_content = [{"type": "text", "text": prev_content}] + curr_content
+                else:
+                    new_content = prev_content + [{"type": "text", "text": curr_content}]
+                # Copy, never mutate — passthrough entries alias the agent's
+                # live history dicts, and in-place edits compound each request.
+                merged[-1] = {**merged[-1], "content": new_content}
             else:
                 merged.append(msg)
         return merged

@@ -1,5 +1,5 @@
 """
-Speech-to-text via Deepgram Nova-2.
+Speech-to-text via Deepgram.
 
 Provides both sync and async helpers so every channel can call
 ``transcribe_audio`` without worrying about event-loop differences.
@@ -8,9 +8,8 @@ Returns the transcript string on success, or ``None`` when the Deepgram
 API key is not configured.
 
 Language is configurable via ``deepgram.language`` in pythonclaw.json:
-  - ``"multi"`` (default) — multilingual mode, works for any language
+  - ``"auto"`` (default) — auto-detect, with fallback retries for short clips
   - ``"zh"``/``"en"``/``"ja"``/… — force a specific language
-  - ``"auto"`` — auto-detect (needs ~5 s+ of audio to be reliable)
 """
 
 from __future__ import annotations
@@ -20,6 +19,17 @@ import logging
 logger = logging.getLogger(__name__)
 
 _DEEPGRAM_BASE = "https://api.deepgram.com/v1/listen"
+
+# Retried in order when auto-detect returns empty (short clips). Capped so a
+# silent clip can't burn minutes of sequential API calls; override the pool
+# via ``deepgram.fallbackLanguages`` in pythonclaw.json.
+_FALLBACK_LANGUAGES = ("zh", "en", "ja")
+
+
+def _get_fallback_languages() -> tuple[str, ...]:
+    from .. import config
+    langs = config.get_list("deepgram", "fallbackLanguages")
+    return tuple(langs) if langs else _FALLBACK_LANGUAGES
 
 _NO_KEY_MSG = (
     "Voice messages are not enabled yet.\n\n"
@@ -37,18 +47,26 @@ def _get_key() -> str | None:
     return config.get("deepgram", "apiKey", env="DEEPGRAM_API_KEY") or None
 
 
-def _build_url() -> str:
-    """Build the Deepgram API URL with language/model parameters."""
+def _get_config_language() -> str:
     from .. import config
+    return config.get_str("deepgram", "language") or "auto"
 
-    lang = config.get_str("deepgram", "language") or "multi"
-    model = config.get_str("deepgram", "model") or "nova-2"
 
-    params = [
-        f"model={model}",
-        "smart_format=true",
-        "punctuate=true",
-    ]
+def _get_model() -> str:
+    from .. import config
+    return config.get_str("deepgram", "model") or "nova-2"
+
+
+def _build_url(language: str | None = None) -> str:
+    """Build the Deepgram API URL.
+
+    If *language* is given, use it directly (e.g. ``"zh"``).
+    If ``None``, read from config (default ``"auto"`` → detect_language).
+    """
+    model = _get_model()
+    lang = language or _get_config_language()
+
+    params = [f"model={model}", "smart_format=true", "punctuate=true"]
 
     if lang == "auto":
         params.append("detect_language=true")
@@ -58,44 +76,70 @@ def _build_url() -> str:
     return f"{_DEEPGRAM_BASE}?{'&'.join(params)}"
 
 
+def _headers(key: str, content_type: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Token {key}",
+        "Content-Type": content_type,
+    }
+
+
+# ── Sync ──────────────────────────────────────────────────────────────────────
+
 def transcribe_bytes(audio: bytes, content_type: str = "audio/ogg") -> str | None:
-    """Blocking transcription — safe to call from a thread / executor.
+    """Blocking transcription with automatic fallback for short clips.
 
     Returns the transcript text, or ``None`` if no Deepgram key is set.
-    Raises on network / API errors.
     """
     key = _get_key()
     if not key:
         return None
 
+    cfg_lang = _get_config_language()
+
+    if cfg_lang != "auto":
+        return _call_sync(key, audio, content_type, language=cfg_lang)
+
+    transcript = _call_sync(key, audio, content_type, language=None)
+    if transcript:
+        return transcript
+
+    # One rejected language (e.g. a model/language combo returning 400) must
+    # not abort the whole chain — catch per attempt and move on.
+    for lang in _get_fallback_languages():
+        try:
+            transcript = _call_sync(key, audio, content_type, language=lang)
+        except Exception as exc:
+            logger.debug("[STT] Fallback language=%s failed: %s", lang, exc)
+            continue
+        if transcript:
+            logger.info("[STT] Fallback to language=%s succeeded", lang)
+            return transcript
+
+    logger.warning("[STT] All fallback languages returned empty (bytes=%d)", len(audio))
+    return ""
+
+
+def _call_sync(
+    key: str, audio: bytes, content_type: str, language: str | None
+) -> str:
     import httpx
 
-    url = _build_url()
+    url = _build_url(language=language or "auto")
     resp = httpx.post(
-        url,
-        content=audio,
-        headers={
-            "Authorization": f"Token {key}",
-            "Content-Type": content_type,
-        },
+        url, content=audio,
+        headers=_headers(key, content_type),
         timeout=30.0,
     )
     resp.raise_for_status()
-    data = resp.json()
-    transcript = _extract_transcript(data)
-    if not transcript:
-        detected = _extract_language(data)
-        logger.warning(
-            "[STT] Empty transcript (detected_lang=%s, bytes=%d, mime=%s)",
-            detected, len(audio), content_type,
-        )
-    return transcript
+    return _extract_transcript(resp.json())
 
+
+# ── Async ─────────────────────────────────────────────────────────────────────
 
 async def transcribe_bytes_async(
     audio: bytes, content_type: str = "audio/ogg"
 ) -> str | None:
-    """Non-blocking transcription for async contexts.
+    """Non-blocking transcription with automatic fallback for short clips.
 
     Returns the transcript text, or ``None`` if no Deepgram key is set.
     """
@@ -103,29 +147,45 @@ async def transcribe_bytes_async(
     if not key:
         return None
 
+    cfg_lang = _get_config_language()
+
+    if cfg_lang != "auto":
+        return await _call_async(key, audio, content_type, language=cfg_lang)
+
+    transcript = await _call_async(key, audio, content_type, language=None)
+    if transcript:
+        return transcript
+
+    for lang in _get_fallback_languages():
+        try:
+            transcript = await _call_async(key, audio, content_type, language=lang)
+        except Exception as exc:
+            logger.debug("[STT] Fallback language=%s failed: %s", lang, exc)
+            continue
+        if transcript:
+            logger.info("[STT] Fallback to language=%s succeeded", lang)
+            return transcript
+
+    logger.warning("[STT] All fallback languages returned empty (bytes=%d)", len(audio))
+    return ""
+
+
+async def _call_async(
+    key: str, audio: bytes, content_type: str, language: str | None
+) -> str:
     import httpx
 
-    url = _build_url()
+    url = _build_url(language=language or "auto")
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(
-            url,
-            content=audio,
-            headers={
-                "Authorization": f"Token {key}",
-                "Content-Type": content_type,
-            },
+            url, content=audio,
+            headers=_headers(key, content_type),
         )
         resp.raise_for_status()
-        data = resp.json()
-    transcript = _extract_transcript(data)
-    if not transcript:
-        detected = _extract_language(data)
-        logger.warning(
-            "[STT] Empty transcript (detected_lang=%s, bytes=%d, mime=%s)",
-            detected, len(audio), content_type,
-        )
-    return transcript
+        return _extract_transcript(resp.json())
 
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _extract_transcript(data: dict) -> str:
     try:
@@ -137,18 +197,6 @@ def _extract_transcript(data: dict) -> str:
         )
     except (IndexError, KeyError):
         return ""
-
-
-def _extract_language(data: dict) -> str:
-    """Extract the detected language code from the Deepgram response."""
-    try:
-        return (
-            data.get("results", {})
-            .get("channels", [{}])[0]
-            .get("detected_language", "unknown")
-        )
-    except (IndexError, KeyError):
-        return "unknown"
 
 
 def no_key_message() -> str:

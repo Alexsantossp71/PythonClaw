@@ -162,8 +162,16 @@ def _run_foreground(args) -> None:
 
     from .web.app import create_app
 
-    host = config.get_str("web", "host", default="0.0.0.0")
+    # Default to loopback — the dashboard has full agent access, so exposing
+    # it on all interfaces must be an explicit choice (web.host in config).
+    host = config.get_str("web", "host", default="127.0.0.1")
     port = config.get_int("web", "port", default=7788)
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        print(
+            f"[PythonClaw] WARNING: web dashboard is binding to {host} — "
+            "anyone who can reach this port can drive your agent. "
+            "Keep web.host on 127.0.0.1 unless you know what you're doing."
+        )
 
     app = create_app(provider, build_provider_fn=_build_provider)
 
@@ -482,13 +490,22 @@ def _handle_legacy_mode(args) -> None:
 # ── Entry point ──────────────────────────────────────────────────────────────
 
 def main():
-    config.load()
+    # A malformed config must not brick lifecycle commands like `stop`.
+    try:
+        config.load()
+    except Exception as exc:
+        print(f"Warning: could not parse config ({config.config_path() or 'pythonclaw.json'}): {exc}")
+        print("Continuing with defaults — fix the JSON to restore your settings.")
 
     parser = _build_parser()
     args = parser.parse_args()
 
     if args.config:
-        config.load(args.config, force=True)
+        try:
+            config.load(args.config, force=True)
+        except Exception as exc:
+            print(f"Error: could not parse config {args.config}: {exc}")
+            return
 
     # Handle legacy --mode flag
     if args.mode and not args.command:

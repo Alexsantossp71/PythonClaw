@@ -48,6 +48,10 @@
 | 🔧 | **TOOLS.md** | Local environment notes — your cheat sheet for the agent |
 | 🔒 | **Per-group isolation** | Each chat session gets its own memory (optional) |
 | 🔁 | **Concurrency control** | Per-session locks + global semaphore prevent interleaving |
+| 📐 | **Context engineering** | Tool-output truncation with paged spill-over files, turn-integrity pruning, pair-safe compaction with pre-flush to memory |
+| ⚡ | **Parallel everything** | Batched parallel tool calls, `multi_search` fan-out, non-blocking tool timeouts |
+| 🛑 | **Loop breaker** | Repeated identical tool calls are short-circuited so the agent can't burn rounds retrying itself |
+| 🛡️ | **Hardened** | Zip-slip-safe skill installs, TLS-verified hub downloads, path-traversal guards, atomic persistence, loopback-only dashboard by default |
 
 ---
 
