@@ -35,7 +35,7 @@
 
 | | Feature | Details |
 |---|---------|---------|
-| 🧠 | **Provider-agnostic** | DeepSeek, Grok, Claude, Gemini, Kimi, GLM — or any OpenAI-compatible API |
+| 🧠 | **Provider-agnostic** | DeepSeek, Grok, Claude, Gemini, Kimi, GLM, **Ollama (100% local)** — or any OpenAI-compatible API |
 | 🛠️ | **Three-tier skills** | Progressive loading: metadata → instructions → resources. Community marketplace via [ClawHub](https://clawhub.com) (13K+ free skills) |
 | 💾 | **Persistent memory** | Markdown-based long-term memory with daily logs and semantic recall |
 | 🔍 | **Hybrid RAG** | BM25 + dense embeddings + RRF fusion + LLM re-ranking |
@@ -201,15 +201,52 @@ Environment variables (e.g. `DEEPSEEK_API_KEY`, `TAVILY_API_KEY`) override JSON 
 
 ## Supported LLM Providers
 
-| Provider | Default Model | Install Extra |
-|----------|---------------|---------------|
-| **DeepSeek** | `deepseek-chat` | — |
-| **Grok (xAI)** | `grok-3` | — |
-| **Claude (Anthropic)** | `claude-sonnet-4-20250514` | — (included) |
-| **Gemini (Google)** | `gemini-2.0-flash` | — (included) |
-| **Kimi (Moonshot)** | `moonshot-v1-128k` | — |
-| **GLM (Zhipu)** | `glm-4-flash` | — |
-| Any OpenAI-compatible | Custom | — |
+| Provider | `llm.provider` | Default Model | API key |
+|----------|----------------|---------------|---------|
+| **DeepSeek** | `deepseek` | `deepseek-chat` | `DEEPSEEK_API_KEY` |
+| **Grok (xAI)** | `grok` | `grok-3` | `GROK_API_KEY` |
+| **Claude (Anthropic)** | `claude` | `claude-sonnet-4-20250514` | `ANTHROPIC_API_KEY` (or `claude setup-token`) |
+| **Gemini (Google)** | `gemini` | `gemini-2.0-flash` | `GEMINI_API_KEY` |
+| **Kimi (Moonshot)** | `kimi` | `moonshot-v1-128k` | `KIMI_API_KEY` |
+| **GLM (Zhipu)** | `glm` | `glm-4-flash` | `GLM_API_KEY` |
+| **Ollama (local)** 🆕 | `ollama` | `llama3.1` | none — 100% local |
+| **Any OpenAI-compatible** 🆕 | `custom` | `gpt-4o-mini` | `OPENAI_API_KEY` |
+
+`custom` works with OpenAI, OpenRouter, LM Studio, vLLM, llama.cpp server — anything speaking the chat-completions protocol (set `llm.custom.baseUrl`).
+
+### Run 100% local with Ollama
+
+No API key, no cloud, your data never leaves the machine:
+
+```bash
+ollama pull llama3.1        # or qwen3, mistral, …
+pip install pythonclaw
+
+LLM_PROVIDER=ollama pythonclaw chat        # CLI
+LLM_PROVIDER=ollama pythonclaw start       # daemon + web dashboard
+```
+
+Pick a different model with `OLLAMA_MODEL=qwen3`, or point at a remote Ollama with `OLLAMA_BASE_URL=http://gpu-box:11434/v1`.
+
+---
+
+## Docker
+
+```bash
+docker run -p 7788:7788 \
+  -e LLM_PROVIDER=deepseek -e DEEPSEEK_API_KEY=sk-... \
+  -v pythonclaw-data:/root/.pythonclaw \
+  $(docker build -q .)
+```
+
+Or with compose (edit the environment block / use a `.env` file):
+
+```bash
+git clone https://github.com/ericwang915/PythonClaw.git && cd PythonClaw
+docker compose up -d
+```
+
+Fully local stack: run Ollama on the host and set `LLM_PROVIDER=ollama` — the compose file already routes `host.docker.internal` for you.
 
 ---
 

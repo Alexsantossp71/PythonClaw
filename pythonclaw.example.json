@@ -28,6 +28,15 @@
       "apiKey": "",
       "model": "glm-4-flash",
       "baseUrl": "https://open.bigmodel.cn/api/paas/v4/"
+    },
+    "ollama": {
+      "model": "llama3.1",
+      "baseUrl": "http://localhost:11434/v1"
+    },
+    "custom": {
+      "apiKey": "",
+      "model": "gpt-4o-mini",
+      "baseUrl": "https://api.openai.com/v1"
     }
   },
   "tavily": {
@@ -40,7 +49,7 @@
     "apiKey": ""
   },
   "web": {
-    "host": "0.0.0.0",
+    "host": "127.0.0.1",
     "port": 7788
   },
   "channels": {

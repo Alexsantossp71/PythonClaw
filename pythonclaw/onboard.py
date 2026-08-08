@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import getpass
 import json
+import os
 from pathlib import Path
 
 from . import config
@@ -372,16 +373,54 @@ def _save_config(cfg: dict, config_path: str | None) -> Path:
     return out
 
 
+# provider name → env var carrying its API key (aliases included)
+_PROVIDER_ENV_KEYS = {
+    "deepseek": "DEEPSEEK_API_KEY",
+    "grok": "GROK_API_KEY",
+    "claude": "ANTHROPIC_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "kimi": "KIMI_API_KEY",
+    "moonshot": "KIMI_API_KEY",
+    "glm": "GLM_API_KEY",
+    "zhipu": "GLM_API_KEY",
+    "chatglm": "GLM_API_KEY",
+    "custom": "OPENAI_API_KEY",
+    "openai": "OPENAI_API_KEY",
+}
+
+# provider alias → config section holding its apiKey
+_PROVIDER_SECTIONS = {
+    "anthropic": "claude",
+    "moonshot": "kimi",
+    "zhipu": "glm",
+    "chatglm": "glm",
+    "openai": "custom",
+}
+
+
 def needs_onboard(config_path: str | None = None) -> bool:
-    """Check if onboarding is needed (no config or no API key)."""
+    """Check if onboarding is needed (no config or no API key).
+
+    Env-var configuration counts — a Docker container started with
+    LLM_PROVIDER + the matching API key env must not hang on the wizard.
+    """
     try:
         config.load(config_path)
     except Exception:
         return True
 
-    provider = config.get_str("llm", "provider", default="")
+    provider = config.get_str("llm", "provider", env="LLM_PROVIDER", default="").lower()
     if not provider:
         return True
 
-    api_key = config.get_str("llm", provider, "apiKey", default="")
+    if provider == "ollama":
+        return False  # local — no API key required
+
+    env_name = _PROVIDER_ENV_KEYS.get(provider)
+    if env_name and os.environ.get(env_name):
+        return False
+
+    section = _PROVIDER_SECTIONS.get(provider, provider)
+    api_key = config.get_str("llm", section, "apiKey", default="")
     return not api_key

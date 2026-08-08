@@ -372,3 +372,31 @@ def test_chunker_no_infinite_loop_with_bad_overlap():
 
     chunks = chunk_text("A" * 1000, source="s", chunk_size=100, overlap=100)
     assert len(chunks) >= 1
+
+
+# ── providers: ollama / env-aware onboarding ─────────────────────────────────
+
+def test_ollama_provider_builds_without_api_key(monkeypatch):
+    pytest.importorskip("openai")
+    from pythonclaw import config, main
+
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.setattr(config, "_config", {"llm": {"provider": "ollama"}})
+    provider = main._build_provider()
+    assert "11434" in str(provider.client.base_url)
+    assert provider.model_name == "llama3.1"
+
+
+def test_needs_onboard_honours_env_and_ollama(monkeypatch):
+    from pythonclaw import config, onboard
+
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+
+    monkeypatch.setattr(config, "_config", {"llm": {"provider": "deepseek"}})
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    assert onboard.needs_onboard() is False
+    monkeypatch.delenv("DEEPSEEK_API_KEY")
+    assert onboard.needs_onboard() is True
+
+    monkeypatch.setattr(config, "_config", {"llm": {"provider": "ollama"}})
+    assert onboard.needs_onboard() is False

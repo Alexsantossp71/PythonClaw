@@ -107,6 +107,39 @@ def _build_provider():
             ),
         )
 
+    if provider_name == "ollama":
+        from .core.llm.openai_compatible import OpenAICompatibleProvider
+        # Ollama needs no API key — the SDK just requires a non-empty string.
+        return OpenAICompatibleProvider(
+            api_key=config.get_str("llm", "ollama", "apiKey", default="ollama"),
+            base_url=config.get_str(
+                "llm", "ollama", "baseUrl", env="OLLAMA_BASE_URL",
+                default="http://localhost:11434/v1",
+            ),
+            model_name=config.get_str(
+                "llm", "ollama", "model", env="OLLAMA_MODEL", default="llama3.1",
+            ),
+        )
+
+    if provider_name in ("custom", "openai"):
+        # Any OpenAI-compatible endpoint: OpenAI itself, OpenRouter,
+        # LM Studio, vLLM, llama.cpp server, …
+        from .core.llm.openai_compatible import OpenAICompatibleProvider
+        api_key = config.get_str("llm", "custom", "apiKey", env="OPENAI_API_KEY")
+        base_url = config.get_str(
+            "llm", "custom", "baseUrl", env="OPENAI_BASE_URL",
+            default="https://api.openai.com/v1",
+        )
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY not set (env or llm.custom.apiKey in pythonclaw.json)")
+        return OpenAICompatibleProvider(
+            api_key=api_key,
+            base_url=base_url,
+            model_name=config.get_str(
+                "llm", "custom", "model", env="OPENAI_MODEL", default="gpt-4o-mini",
+            ),
+        )
+
     raise ValueError(f"Unknown LLM_PROVIDER: '{provider_name}'")
 
 
@@ -163,9 +196,10 @@ def _run_foreground(args) -> None:
     from .web.app import create_app
 
     # Default to loopback — the dashboard has full agent access, so exposing
-    # it on all interfaces must be an explicit choice (web.host in config).
-    host = config.get_str("web", "host", default="127.0.0.1")
-    port = config.get_int("web", "port", default=7788)
+    # it on all interfaces must be an explicit choice (web.host in config,
+    # or PYTHONCLAW_WEB_HOST=0.0.0.0 for containers).
+    host = config.get_str("web", "host", env="PYTHONCLAW_WEB_HOST", default="127.0.0.1")
+    port = config.get_int("web", "port", env="PYTHONCLAW_WEB_PORT", default=7788)
     if host not in ("127.0.0.1", "localhost", "::1"):
         print(
             f"[PythonClaw] WARNING: web dashboard is binding to {host} — "
