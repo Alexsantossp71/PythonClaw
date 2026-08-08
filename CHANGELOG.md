@@ -5,10 +5,11 @@ All notable changes to PythonClaw are documented here.
 ## [0.7.1] — 2026-08-08
 
 ### Added
-- **Ollama provider** — run 100% local, no API key (`LLM_PROVIDER=ollama`)
+- **Ollama provider** — run 100% local, no API key (`LLM_PROVIDER=ollama`), now also selectable in the `onboard` wizard
 - **`custom` provider** — any OpenAI-compatible endpoint (OpenAI, OpenRouter, LM Studio, vLLM, llama.cpp server)
 - **Docker support** — `Dockerfile` + `docker-compose.yml`, env-first configuration (`PYTHONCLAW_WEB_HOST`, `PYTHONCLAW_WEB_PORT`)
 - Onboard detection now honours env-var configuration, so containers never hang on the interactive wizard
+- Reworked README: sharper value prop, "Why PythonClaw", quick-start with the local one-liner, table of contents, corrected security defaults
 
 ## [0.7.0] — 2026-08-08
 

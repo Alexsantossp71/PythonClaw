@@ -74,6 +74,14 @@ PROVIDERS = [
         "default_base": "https://open.bigmodel.cn/api/paas/v4/",
         "env": "GLM_API_KEY",
     },
+    {
+        "key": "ollama",
+        "name": "Ollama (100% local — no API key)",
+        "default_model": "llama3.1",
+        "default_base": "http://localhost:11434/v1",
+        "env": None,
+        "no_key": True,
+    },
 ]
 
 
@@ -163,6 +171,13 @@ def _choose_provider(cfg: dict) -> dict:
 
 
 def _get_api_key(provider: dict, cfg: dict) -> str:
+    if provider.get("no_key"):
+        print(f"  {_c(provider['name'], _GREEN)} runs locally — no API key needed.")
+        model = provider.get("default_model", "")
+        print(_c(f"    Make sure Ollama is running and `ollama pull {model}` is done.", _DIM))
+        print()
+        return "ollama"  # non-empty placeholder the OpenAI SDK requires
+
     existing = cfg.get("llm", {}).get(provider["key"], {}).get("apiKey", "")
     has_existing = bool(existing) and existing != ""
 
@@ -314,7 +329,7 @@ def _validate_key(cfg: dict, provider: dict) -> None:
     api_key = cfg["llm"][prov_key]["apiKey"]
 
     try:
-        if prov_key in ("deepseek", "grok", "kimi", "glm"):
+        if prov_key in ("deepseek", "grok", "kimi", "glm", "ollama"):
             from .core.llm.openai_compatible import OpenAICompatibleProvider
             base_url = cfg["llm"][prov_key].get("baseUrl", provider["default_base"])
             model = cfg["llm"][prov_key].get("model", provider["default_model"])

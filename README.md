@@ -1,12 +1,13 @@
 <p align="center">
-  <img src="assets/logo-300.png" alt="PythonClaw" width="160">
+  <img src="assets/logo-300.png" alt="PythonClaw" width="150">
 </p>
 
 <h1 align="center">PythonClaw</h1>
 
 <p align="center">
-  <strong>OpenClaw, reimagined in pure Python — purely Pythonic design.</strong><br>
-  Memory · RAG · Skills · Web Dashboard · Voice · Daemon · Multi-Channel
+  <strong>A personal AI agent you own — in pure Python.</strong><br>
+  <code>pip install</code> and talk to it from your terminal, a web dashboard, or Telegram /
+  Discord / WhatsApp.<br>It remembers what matters, learns new skills on demand, and runs tasks on a schedule.
 </p>
 
 <p align="center">
@@ -26,54 +27,57 @@
 </p>
 
 <p align="center">
-  <em>The Python port of <a href="https://github.com/openclaw/openclaw">OpenClaw</a> — no Node.js, no Rust, no C extensions. Just Python.</em>
+  <em>The Python reimagining of <a href="https://github.com/openclaw/openclaw">OpenClaw</a> — no Node.js, no Rust, no C extensions. Just Python.</em>
+</p>
+
+<!--
+  ┌─ TOP PRIORITY: add a demo GIF here ─────────────────────────────────────────┐
+  │ A 30–60s screen capture is the single biggest lever for turning repo        │
+  │ visitors into stars. Suggested shot: terminal running `pip install          │
+  │ pythonclaw && pythonclaw onboard` on the left, a Telegram chat on the right  │
+  │ where you send a voice note and the agent installs a skill and does a task.  │
+  │ Save it as assets/demo.gif, then uncomment:                                  │
+  │   <p align="center"><img src="assets/demo.gif" alt="PythonClaw demo" width="760"></p>
+  └─────────────────────────────────────────────────────────────────────────────┘
+-->
+
+<p align="center">
+  <a href="#quick-start">Quick&nbsp;Start</a> ·
+  <a href="#run-100-local-with-ollama">Local&nbsp;with&nbsp;Ollama</a> ·
+  <a href="#docker">Docker</a> ·
+  <a href="#supported-llm-providers">Providers</a> ·
+  <a href="#skills">Skills</a> ·
+  <a href="#configuration">Config</a> ·
+  <a href="#use-as-a-library">Library</a>
 </p>
 
 ---
 
-## Highlights
+## Why PythonClaw
 
-| | Feature | Details |
-|---|---------|---------|
-| 🧠 | **Provider-agnostic** | DeepSeek, Grok, Claude, Gemini, Kimi, GLM, **Ollama (100% local)** — or any OpenAI-compatible API |
-| 🛠️ | **Three-tier skills** | Progressive loading: metadata → instructions → resources. Community marketplace via [ClawHub](https://clawhub.com) (13K+ free skills) |
-| 💾 | **Persistent memory** | Markdown-based long-term memory with daily logs and semantic recall |
-| 🔍 | **Hybrid RAG** | BM25 + dense embeddings + RRF fusion + LLM re-ranking |
-| 🌐 | **Web dashboard** | Browser UI for chat, config, skill catalog, identity editing, and marketplace |
-| 🎙️ | **Voice input** | Deepgram speech-to-text in the web chat |
-| ⏰ | **Cron jobs** | Schedule tasks via YAML or let the agent create its own |
-| 📡 | **Multi-channel** | CLI, Web, Telegram, Discord, WhatsApp — same agent, different interfaces |
-| 🔄 | **Daemon mode** | PID-managed background process with `start` / `stop` / `status` |
-| 🧬 | **Soul + Persona** | Separate core identity from swappable role presentation |
-| 🔧 | **TOOLS.md** | Local environment notes — your cheat sheet for the agent |
-| 🔒 | **Per-group isolation** | Each chat session gets its own memory (optional) |
-| 🔁 | **Concurrency control** | Per-session locks + global semaphore prevent interleaving |
-| 📐 | **Context engineering** | Tool-output truncation with paged spill-over files, turn-integrity pruning, pair-safe compaction with pre-flush to memory |
-| ⚡ | **Parallel everything** | Batched parallel tool calls, `multi_search` fan-out, non-blocking tool timeouts |
-| 🛑 | **Loop breaker** | Repeated identical tool calls are short-circuited so the agent can't burn rounds retrying itself |
-| 🛡️ | **Hardened** | Zip-slip-safe skill installs, TLS-verified hub downloads, path-traversal guards, atomic persistence, loopback-only dashboard by default |
-
----
+- 🐍 **Pure Python, zero build step** — one `pip install`, no Node/Rust/C toolchain. Import it as a library, not just a CLI.
+- 🔌 **Any model, or none** — DeepSeek, Claude, Gemini, Kimi, GLM… or **[100% local with Ollama](#run-100-local-with-ollama)**: no API key, nothing leaves your machine.
+- 📡 **One agent, everywhere** — the same brain answers from your CLI, a browser dashboard, and group chats, each with isolated memory.
+- 🧩 **It grows itself** — pulls from a 13K-skill [marketplace](#clawhub-marketplace), and can write and install a brand-new skill at runtime when none fits.
 
 ## Quick Start
 
 ```bash
 pip install pythonclaw
 
-# First-time setup — choose your LLM provider and enter API key
-pythonclaw onboard
-
-# Start the agent daemon (web dashboard at http://localhost:7788)
-pythonclaw start
-
-# Interactive CLI chat
-pythonclaw chat
-
-# Stop the daemon
-pythonclaw stop
+pythonclaw onboard    # pick a provider, paste an API key (or choose Ollama — no key)
+pythonclaw start      # daemon + web dashboard at http://localhost:7788
+pythonclaw chat       # or just chat in the terminal
 ```
 
-**From source:**
+Prefer to stay fully offline? One line, no key:
+
+```bash
+LLM_PROVIDER=ollama pythonclaw chat      # needs a local Ollama running
+```
+
+<details>
+<summary><b>Install from source</b></summary>
 
 ```bash
 git clone https://github.com/ericwang915/PythonClaw.git
@@ -81,6 +85,41 @@ cd PythonClaw
 pip install -e .
 pythonclaw onboard
 ```
+</details>
+
+---
+
+## What's inside
+
+| | Feature | Details |
+|---|---------|---------|
+| 🧠 | **Provider-agnostic** | DeepSeek, Grok, Claude, Gemini, Kimi, GLM, **Ollama (100% local)** — or any OpenAI-compatible API |
+| 🛠️ | **Self-extending skills** | Three-tier progressive loading (metadata → instructions → resources) + a 13K-skill [ClawHub](https://clawhub.com) marketplace, and the agent can author its own |
+| 💾 | **Persistent memory** | Plain-Markdown long-term memory with daily logs and semantic recall — grep-able, backup-able, no database |
+| 🔍 | **Hybrid RAG** | BM25 + dense embeddings + RRF fusion + LLM re-ranking over your own docs |
+| 🌐 | **Web dashboard** | Browser UI for chat, config, skill catalog, identity editing, and marketplace |
+| 🎙️ | **Voice input** | Deepgram speech-to-text in the web and messaging channels |
+| ⏰ | **Cron jobs** | Schedule tasks in config, or let the agent schedule its own and message you |
+| 📡 | **Multi-channel** | CLI, Web, Telegram, Discord, WhatsApp — one agent behind every front-end |
+
+<details>
+<summary><b>Under the hood</b> — reliability &amp; context engineering</summary>
+
+<br>
+
+| | | |
+|---|---|---|
+| 🔄 | **Daemon mode** | PID-managed background process with `start` / `stop` / `status` |
+| 🧬 | **Soul + Persona** | Separate the agent's core identity from its swappable role presentation |
+| 🔧 | **TOOLS.md** | Your local environment notes (SSH hosts, paths, defaults) — kept apart from shareable skills |
+| 🔒 | **Per-group isolation** | Each chat session can get its own memory, persona, and soul |
+| 📐 | **Context engineering** | Tool-output truncation with paged spill-over files, turn-integrity pruning, pair-safe compaction with pre-flush to memory |
+| ⚡ | **Parallel by default** | Batched parallel tool calls, `multi_search` fan-out, non-blocking tool timeouts |
+| 🛑 | **Loop breaker** | Repeated identical tool calls are short-circuited so the agent can't burn rounds retrying itself |
+| 🔁 | **Concurrency control** | Per-session locks + a global semaphore prevent history interleaving |
+| 🛡️ | **Hardened** | Zip-slip-safe skill installs, TLS-verified downloads, path-traversal guards, atomic persistence, loopback-only dashboard by default |
+
+</details>
 
 ---
 
@@ -117,12 +156,13 @@ $ pythonclaw start
     4. Gemini (Google)
     5. Kimi (Moonshot)
     6. GLM (Zhipu / ChatGLM)
+    7. Ollama (100% local — no API key)
 
-  Enter number (1-6): 2
-  → Grok (xAI)
+  Enter number (1-7): 1
+  → DeepSeek
 
   API Key: ********
-  → Key set (xai-****)
+  → Key set (sk-****)
 
   Validating... ✔ Valid!
   ✔ Setup complete!
@@ -151,7 +191,7 @@ $ pythonclaw start
 │          │ WhatsApp   │           │ └─ Tool Execution        │
 ├──────────┴────────────┴───────────┴──────────────────────────┤
 │               LLM Provider Abstraction Layer                 │
-│ DeepSeek │ Grok │ Claude │ Gemini │ Kimi │ GLM              │
+│ DeepSeek │ Grok │ Claude │ Gemini │ Kimi │ GLM │ Ollama │ …  │
 ├──────────────────────────────────────────────────────────────┤
 │              ClawHub Marketplace (clawhub.com)               │
 └──────────────────────────────────────────────────────────────┘
@@ -184,7 +224,7 @@ See [`pythonclaw.example.json`](pythonclaw.example.json) for the full template.
   },
   "tavily":   { "apiKey": "" },
   "deepgram": { "apiKey": "" },
-  "web":      { "host": "0.0.0.0", "port": 7788 },
+  "web":      { "host": "127.0.0.1", "port": 7788 },
   "channels": {
     "telegram": { "token": "" },
     "discord":  { "token": "" },
@@ -195,7 +235,9 @@ See [`pythonclaw.example.json`](pythonclaw.example.json) for the full template.
 }
 ```
 
-Environment variables (e.g. `DEEPSEEK_API_KEY`, `TAVILY_API_KEY`) override JSON values.
+Environment variables (e.g. `DEEPSEEK_API_KEY`, `TAVILY_API_KEY`, `LLM_PROVIDER`) override JSON values.
+
+> **Security:** the dashboard has full agent access, so `web.host` defaults to `127.0.0.1` (loopback only). Expose it deliberately — set `web.host` to `0.0.0.0` (or `PYTHONCLAW_WEB_HOST=0.0.0.0` in containers) only behind your own auth/tunnel.
 
 ---
 
@@ -399,7 +441,9 @@ We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 | Skills | Plugin system | Three-tier + ClawHub marketplace |
 | Channels | Discord, Telegram, WhatsApp | CLI, Web, Telegram, Discord, WhatsApp |
 | Voice | — | Deepgram STT |
-| LLM Providers | OpenAI, Anthropic, Gemini | DeepSeek, Grok, Claude, Gemini, Kimi, GLM |
+| LLM Providers | OpenAI, Anthropic, Gemini | DeepSeek, Grok, Claude, Gemini, Kimi, GLM + any OpenAI-compatible |
+| Run fully local | — | **Yes — Ollama, no API key** |
+| Deploy | npm | pip · Docker · docker-compose |
 | Daemon | Background process | PID-managed (`start`/`stop`/`status`) |
 
 ---
