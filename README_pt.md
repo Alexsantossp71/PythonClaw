@@ -1,0 +1,1 @@
+# PythonClaw - Agente pessoal de IA em Python
